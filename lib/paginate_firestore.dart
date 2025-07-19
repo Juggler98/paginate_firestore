@@ -144,8 +144,8 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
 
   @override
   void dispose() {
-    for (var r in _listenerRemovers) {
-      r();
+    for (var remove in _listenerRemovers) {
+      remove();
     }
     widget.scrollController?.dispose();
     _cubit?.close();
