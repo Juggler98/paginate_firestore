@@ -63,32 +63,25 @@ class PaginationCubit extends Cubit<PaginationState> {
   }
 
   Future<void> refreshPaginatedList() async {
-    _clearListeners();
     _lastDocument = null;
     final localQuery = _getQuery();
     try {
       if (isLive) {
         final listener = localQuery
             .snapshots(includeMetadataChanges: includeMetadataChanges)
-            .listen(
-          (querySnapshot) {
-            _emitPaginatedState(querySnapshot.docs);
-          },
-          onError: (error) {
-            emit(PaginationError(error: error as Exception));
-            _clearListeners();
-          },
-          cancelOnError: true,
-        );
-
+            .listen((querySnapshot) {
+          _emitPaginatedState(querySnapshot.docs);
+        });
+        _clearListeners();
         _streams.add(listener);
       } else {
         final querySnapshot = await localQuery.get(options);
         _emitPaginatedState(querySnapshot.docs);
       }
-    } on Exception catch (e) {
-      emit(PaginationError(error: e));
-      _clearListeners();
+    } catch (error, stackTrace) {
+      if (kDebugMode) {
+        debugPrintStack(label: error.toString(), stackTrace: stackTrace);
+      }
     }
   }
 
@@ -102,59 +95,60 @@ class PaginationCubit extends Cubit<PaginationState> {
     try {
       if (state is PaginationInitial) {
         await refreshPaginatedList();
-      } else {
-        isLive ? _getLiveDocuments() : _getDocuments();
+      } else if (state is PaginationLoaded) {
+        if (isLive) {
+          await _getLiveDocuments();
+        } else {
+          await _getDocuments();
+        }
+      }
+    } catch (error, stackTrace) {
+      if (kDebugMode) {
+        debugPrintStack(label: error.toString(), stackTrace: stackTrace);
       }
     } finally {
       _isFetching = false;
     }
   }
 
-  void _getDocuments() async {
+  Future<void> _getDocuments() async {
     final localQuery = _getQuery();
     try {
-      if (state is PaginationInitial) {
-        //this can be removed?
-        //refreshPaginatedList();
-      } else if (state is PaginationLoaded) {
-        final loadedState = state as PaginationLoaded;
-        if (loadedState.hasReachedEnd) return;
-        final querySnapshot = await localQuery.get(options);
-        _emitPaginatedState(
-          querySnapshot.docs,
-          previousList:
-              loadedState.documentSnapshots as List<QueryDocumentSnapshot>,
-        );
+      final loadedState = state as PaginationLoaded;
+      if (loadedState.hasReachedEnd) {
+        return;
       }
+      final querySnapshot = await localQuery.get(options);
+      _emitPaginatedState(
+        querySnapshot.docs,
+        previousList:
+            loadedState.documentSnapshots as List<QueryDocumentSnapshot>,
+      );
     } on PlatformException catch (exception) {
       if (kDebugMode) {
         print(exception);
       }
-      emit(PaginationError(error: exception));
     }
   }
 
-  void _getLiveDocuments() {
+  Future<void> _getLiveDocuments() async {
     final localQuery = _getQuery();
-    if (state is PaginationInitial) {
-      //this can be removed
-      //refreshPaginatedList();
-    } else if (state is PaginationLoaded) {
-      PaginationLoaded loadedState = state as PaginationLoaded;
-      if (loadedState.hasReachedEnd) return;
-      final previousList =
-          loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
-      final listener = localQuery
-          .snapshots(includeMetadataChanges: includeMetadataChanges)
-          .listen((querySnapshot) {
-        _emitPaginatedState(
-          querySnapshot.docs,
-          previousList: previousList,
-        );
-      });
-
-      _streams.add(listener);
+    PaginationLoaded loadedState = state as PaginationLoaded;
+    if (loadedState.hasReachedEnd) {
+      return;
     }
+    final previousList =
+        loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
+    final listener = localQuery
+        .snapshots(includeMetadataChanges: includeMetadataChanges)
+        .listen((querySnapshot) {
+      _emitPaginatedState(
+        querySnapshot.docs,
+        previousList: previousList,
+      );
+    });
+    _clearListeners();
+    _streams.add(listener);
   }
 
   void _emitPaginatedState(

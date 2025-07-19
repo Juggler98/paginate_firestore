@@ -7,6 +7,6 @@ class ErrorDisplay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(child: Text('Error occured: $exception'));
+    return Center(child: Text('Error occurred: $exception'));
   }
 }
