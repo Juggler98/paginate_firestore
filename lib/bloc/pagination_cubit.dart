@@ -27,6 +27,22 @@ class PaginationCubit extends Cubit<PaginationState> {
 
   final _streams = <StreamSubscription<QuerySnapshot>>[];
 
+  @override
+  Future<void> close() {
+    for (var sub in _streams) {
+      sub.cancel();
+    }
+    _streams.clear();
+    return super.close();
+  }
+
+  void _clearListeners() {
+    for (var listener in _streams) {
+      listener.cancel();
+    }
+    _streams.clear();
+  }
+
   void filterPaginatedList(String searchTerm) {
     if (state is PaginationLoaded) {
       final loadedState = state as PaginationLoaded;
@@ -47,6 +63,7 @@ class PaginationCubit extends Cubit<PaginationState> {
   }
 
   void refreshPaginatedList() async {
+    _clearListeners();
     _lastDocument = null;
     final localQuery = _getQuery();
     if (isLive) {
@@ -67,11 +84,12 @@ class PaginationCubit extends Cubit<PaginationState> {
     isLive ? _getLiveDocuments() : _getDocuments();
   }
 
-  _getDocuments() async {
+  void _getDocuments() async {
     final localQuery = _getQuery();
     try {
       if (state is PaginationInitial) {
-        refreshPaginatedList();
+        //this can be removed?
+        //refreshPaginatedList();
       } else if (state is PaginationLoaded) {
         final loadedState = state as PaginationLoaded;
         if (loadedState.hasReachedEnd) return;
@@ -89,21 +107,23 @@ class PaginationCubit extends Cubit<PaginationState> {
     }
   }
 
-  _getLiveDocuments() {
+  void _getLiveDocuments() {
+    _clearListeners();
     final localQuery = _getQuery();
     if (state is PaginationInitial) {
-      refreshPaginatedList();
+      //this can be removed
+      //refreshPaginatedList();
     } else if (state is PaginationLoaded) {
       PaginationLoaded loadedState = state as PaginationLoaded;
       if (loadedState.hasReachedEnd) return;
+      final previousList =
+          loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
       final listener = localQuery
           .snapshots(includeMetadataChanges: includeMetadataChanges)
           .listen((querySnapshot) {
-        loadedState = state as PaginationLoaded;
         _emitPaginatedState(
           querySnapshot.docs,
-          previousList:
-              loadedState.documentSnapshots as List<QueryDocumentSnapshot>,
+          previousList: previousList,
         );
       });
 
@@ -139,11 +159,5 @@ class PaginationCubit extends Cubit<PaginationState> {
             : _query;
     localQuery = localQuery.limit(_limit);
     return localQuery;
-  }
-
-  void dispose() {
-    for (var listener in _streams) {
-      listener.cancel();
-    }
   }
 }
