@@ -29,16 +29,13 @@ class PaginationCubit extends Cubit<PaginationState> {
 
   @override
   Future<void> close() {
-    for (var sub in _streams) {
-      sub.cancel();
-    }
-    _streams.clear();
+    _clearStreams();
     return super.close();
   }
 
-  void _clearListeners() {
-    for (var listener in _streams) {
-      listener.cancel();
+  void _clearStreams() {
+    for (var stream in _streams) {
+      stream.cancel();
     }
     _streams.clear();
   }
@@ -63,6 +60,7 @@ class PaginationCubit extends Cubit<PaginationState> {
   }
 
   Future<void> refreshPaginatedList() async {
+    _clearStreams();
     _lastDocument = null;
     final localQuery = _getQuery();
     try {
@@ -72,7 +70,6 @@ class PaginationCubit extends Cubit<PaginationState> {
             .listen((querySnapshot) {
           _emitPaginatedState(querySnapshot.docs);
         });
-        _clearListeners();
         _streams.add(listener);
       } else {
         final querySnapshot = await localQuery.get(options);
@@ -147,7 +144,6 @@ class PaginationCubit extends Cubit<PaginationState> {
         previousList: previousList,
       );
     });
-    _clearListeners();
     _streams.add(listener);
   }
 
