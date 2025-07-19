@@ -156,6 +156,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
 
   @override
   void initState() {
+    super.initState();
     if (widget.listeners != null) {
       for (var listener in widget.listeners!) {
         VoidCallback remover = () {};
@@ -188,7 +189,6 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       widget.startAfterDocument,
       isLive: widget.isLive,
     )..fetchPaginatedList();
-    super.initState();
   }
 
   Widget _buildGridView(PaginationLoaded loadedState) {

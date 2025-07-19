@@ -135,7 +135,6 @@ class PaginationCubit extends Cubit<PaginationState> {
   }
 
   void _getLiveDocuments() {
-    _clearListeners();
     final localQuery = _getQuery();
     if (state is PaginationInitial) {
       //this can be removed
