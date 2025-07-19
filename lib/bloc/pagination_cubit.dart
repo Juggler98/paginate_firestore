@@ -151,6 +151,9 @@ class PaginationCubit extends Cubit<PaginationState> {
     List<QueryDocumentSnapshot> newList, {
     List<QueryDocumentSnapshot> previousList = const [],
   }) {
+    if (isClosed) {
+      return;
+    }
     _lastDocument = newList.isNotEmpty ? newList.last : null;
     emit(PaginationLoaded(
       documentSnapshots: _mergeSnapshots(previousList, newList),
