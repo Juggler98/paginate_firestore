@@ -13,7 +13,7 @@ class PaginationError extends PaginationState {
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
 
-    return other is PaginationError && other.error == error;
+    return other is PaginationError && other.error.toString() == error.toString();
   }
 
   @override

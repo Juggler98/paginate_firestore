@@ -62,26 +62,52 @@ class PaginationCubit extends Cubit<PaginationState> {
     }
   }
 
-  void refreshPaginatedList() async {
+  Future<void> refreshPaginatedList() async {
     _clearListeners();
     _lastDocument = null;
     final localQuery = _getQuery();
-    if (isLive) {
-      final listener = localQuery
-          .snapshots(includeMetadataChanges: includeMetadataChanges)
-          .listen((querySnapshot) {
-        _emitPaginatedState(querySnapshot.docs);
-      });
+    try {
+      if (isLive) {
+        final listener = localQuery
+            .snapshots(includeMetadataChanges: includeMetadataChanges)
+            .listen(
+          (querySnapshot) {
+            _emitPaginatedState(querySnapshot.docs);
+          },
+          onError: (error) {
+            emit(PaginationError(error: error as Exception));
+            _clearListeners();
+          },
+          cancelOnError: true,
+        );
 
-      _streams.add(listener);
-    } else {
-      final querySnapshot = await localQuery.get(options);
-      _emitPaginatedState(querySnapshot.docs);
+        _streams.add(listener);
+      } else {
+        final querySnapshot = await localQuery.get(options);
+        _emitPaginatedState(querySnapshot.docs);
+      }
+    } on Exception catch (e) {
+      emit(PaginationError(error: e));
+      _clearListeners();
     }
   }
 
-  void fetchPaginatedList() {
-    isLive ? _getLiveDocuments() : _getDocuments();
+  bool _isFetching = false;
+
+  void fetchPaginatedList() async {
+    if (_isFetching) {
+      return;
+    }
+    _isFetching = true;
+    try {
+      if (state is PaginationInitial) {
+        await refreshPaginatedList();
+      } else {
+        isLive ? _getLiveDocuments() : _getDocuments();
+      }
+    } finally {
+      _isFetching = false;
+    }
   }
 
   void _getDocuments() async {
@@ -101,9 +127,10 @@ class PaginationCubit extends Cubit<PaginationState> {
         );
       }
     } on PlatformException catch (exception) {
-      // ignore: avoid_print
-      print(exception);
-      rethrow;
+      if (kDebugMode) {
+        print(exception);
+      }
+      emit(PaginationError(error: exception));
     }
   }
 
