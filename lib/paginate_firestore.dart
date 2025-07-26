@@ -48,6 +48,7 @@ class PaginateFirestore extends StatefulWidget {
     this.isLive = false,
     this.includeMetadataChanges = false,
     this.options,
+    this.globalLimit,
   });
 
   final Widget bottomLoader;
@@ -72,6 +73,10 @@ class PaginateFirestore extends StatefulWidget {
   final DocumentSnapshot? startAfterDocument;
   final Widget? header;
   final Widget? footer;
+
+  ///Set maximum documents which can be fetched.
+  ///The pagination will when this limit is reached.
+  final int? globalLimit;
 
   /// Use this only if `isLive = false`
   final GetOptions? options;
@@ -180,6 +185,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       widget.itemsPerPage,
       widget.startAfterDocument,
       isLive: widget.isLive,
+      globalLimit: widget.globalLimit,
     )..fetchPaginatedList();
   }
 

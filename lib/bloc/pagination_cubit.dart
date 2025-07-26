@@ -15,6 +15,7 @@ class PaginationCubit extends Cubit<PaginationState> {
     this.isLive = false,
     this.includeMetadataChanges = false,
     this.options,
+    this.globalLimit,
   }) : super(PaginationInitial());
 
   DocumentSnapshot? _lastDocument;
@@ -24,6 +25,7 @@ class PaginationCubit extends Cubit<PaginationState> {
   final bool isLive;
   final bool includeMetadataChanges;
   final GetOptions? options;
+  final int? globalLimit;
 
   final _streams = <StreamSubscription<QuerySnapshot>>[];
 
@@ -93,11 +95,7 @@ class PaginationCubit extends Cubit<PaginationState> {
       if (state is PaginationInitial) {
         await refreshPaginatedList();
       } else if (state is PaginationLoaded) {
-        if (isLive) {
-          await _getLiveDocuments();
-        } else {
-          await _getDocuments();
-        }
+        await _getDocuments();
       }
     } catch (error, stackTrace) {
       if (kDebugMode) {
@@ -128,25 +126,6 @@ class PaginationCubit extends Cubit<PaginationState> {
     }
   }
 
-  Future<void> _getLiveDocuments() async {
-    final localQuery = _getQuery();
-    PaginationLoaded loadedState = state as PaginationLoaded;
-    if (loadedState.hasReachedEnd) {
-      return;
-    }
-    final previousList =
-        loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
-    final listener = localQuery
-        .snapshots(includeMetadataChanges: includeMetadataChanges)
-        .listen((querySnapshot) {
-      _emitPaginatedState(
-        querySnapshot.docs,
-        previousList: previousList,
-      );
-    });
-    _streams.add(listener);
-  }
-
   void _emitPaginatedState(
     List<QueryDocumentSnapshot> newList, {
     List<QueryDocumentSnapshot> previousList = const [],
@@ -155,9 +134,12 @@ class PaginationCubit extends Cubit<PaginationState> {
       return;
     }
     _lastDocument = newList.isNotEmpty ? newList.last : null;
+    final mergedList = _mergeSnapshots(previousList, newList);
+    final hasReachedLimit =
+        globalLimit != null && mergedList.length >= globalLimit!;
     emit(PaginationLoaded(
       documentSnapshots: _mergeSnapshots(previousList, newList),
-      hasReachedEnd: newList.isEmpty,
+      hasReachedEnd: hasReachedLimit || newList.length < _limit,
     ));
   }
 
@@ -165,9 +147,10 @@ class PaginationCubit extends Cubit<PaginationState> {
     List<QueryDocumentSnapshot> previousList,
     List<QueryDocumentSnapshot> newList,
   ) {
-    final prevIds = previousList.map((prevSnapshot) => prevSnapshot.id).toSet();
-    newList.retainWhere((newSnapshot) => prevIds.add(newSnapshot.id));
-    return previousList + newList;
+    final prevIds = previousList.map((doc) => doc.id).toSet();
+    final filteredNew =
+        newList.where((doc) => !prevIds.contains(doc.id)).toList();
+    return [...previousList, ...filteredNew];
   }
 
   Query _getQuery() {
