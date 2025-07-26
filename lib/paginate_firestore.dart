@@ -25,6 +25,7 @@ class PaginateFirestore extends StatefulWidget {
         const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2),
     this.startAfterDocument,
     this.itemsPerPage = 15,
+    this.itemsGlobalLimit,
     this.onError,
     this.onReachedEnd,
     this.onLoaded,
@@ -46,9 +47,9 @@ class PaginateFirestore extends StatefulWidget {
     this.header,
     this.footer,
     this.isLive = false,
+    this.isAllItemsLive = true,
     this.includeMetadataChanges = false,
     this.options,
-    this.globalLimit,
   });
 
   final Widget bottomLoader;
@@ -74,9 +75,16 @@ class PaginateFirestore extends StatefulWidget {
   final Widget? header;
   final Widget? footer;
 
-  ///Set maximum documents which can be fetched.
-  ///The pagination will when this limit is reached.
-  final int? globalLimit;
+  /// Set maximum documents which can be fetched.
+  /// The pagination will stop when this limit is reached even when there are more elements.
+  /// Example: Paginate up to 1000 items, then stop loading.
+  final int? itemsGlobalLimit;
+
+  /// Use this only if `isLive = true`
+  /// If set to true the stream will be listening to all items.
+  /// If false, only the first page is live. This is useful for saving reads, when items doesn't change but the new ones are coming (like in chat).
+  /// default is true, so keep in mind, that for each page new listener is created. Therefore when this is true set itemsPerPage to higher value to reduce listeners count.
+  final bool isAllItemsLive;
 
   /// Use this only if `isLive = false`
   final GetOptions? options;
@@ -185,7 +193,10 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       widget.itemsPerPage,
       widget.startAfterDocument,
       isLive: widget.isLive,
-      globalLimit: widget.globalLimit,
+      isAllItemsLive: widget.isAllItemsLive,
+      itemsGlobalLimit: widget.itemsGlobalLimit,
+      includeMetadataChanges: widget.includeMetadataChanges,
+      options: widget.options,
     )..fetchPaginatedList();
   }
 

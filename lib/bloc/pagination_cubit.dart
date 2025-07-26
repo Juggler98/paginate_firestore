@@ -15,7 +15,8 @@ class PaginationCubit extends Cubit<PaginationState> {
     this.isLive = false,
     this.includeMetadataChanges = false,
     this.options,
-    this.globalLimit,
+    this.itemsGlobalLimit,
+    this.isAllItemsLive = true,
   }) : super(PaginationInitial());
 
   DocumentSnapshot? _lastDocument;
@@ -25,7 +26,8 @@ class PaginationCubit extends Cubit<PaginationState> {
   final bool isLive;
   final bool includeMetadataChanges;
   final GetOptions? options;
-  final int? globalLimit;
+  final int? itemsGlobalLimit;
+  final bool isAllItemsLive;
 
   final _streams = <StreamSubscription<QuerySnapshot>>[];
 
@@ -95,7 +97,11 @@ class PaginationCubit extends Cubit<PaginationState> {
       if (state is PaginationInitial) {
         await refreshPaginatedList();
       } else if (state is PaginationLoaded) {
-        await _getDocuments();
+        if (isLive && isAllItemsLive) {
+          await _getLiveDocuments();
+        } else {
+          await _getDocuments();
+        }
       }
     } catch (error, stackTrace) {
       if (kDebugMode) {
@@ -126,6 +132,25 @@ class PaginationCubit extends Cubit<PaginationState> {
     }
   }
 
+  Future<void> _getLiveDocuments() async {
+    final localQuery = _getQuery();
+    PaginationLoaded loadedState = state as PaginationLoaded;
+    if (loadedState.hasReachedEnd) {
+      return;
+    }
+    final previousList =
+        loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
+    final listener = localQuery
+        .snapshots(includeMetadataChanges: includeMetadataChanges)
+        .listen((querySnapshot) {
+      _emitPaginatedState(
+        querySnapshot.docs,
+        previousList: previousList,
+      );
+    });
+    _streams.add(listener);
+  }
+
   void _emitPaginatedState(
     List<QueryDocumentSnapshot> newList, {
     List<QueryDocumentSnapshot> previousList = const [],
@@ -136,7 +161,7 @@ class PaginationCubit extends Cubit<PaginationState> {
     _lastDocument = newList.isNotEmpty ? newList.last : null;
     final mergedList = _mergeSnapshots(previousList, newList);
     final hasReachedLimit =
-        globalLimit != null && mergedList.length >= globalLimit!;
+        itemsGlobalLimit != null && mergedList.length >= itemsGlobalLimit!;
     emit(PaginationLoaded(
       documentSnapshots: _mergeSnapshots(previousList, newList),
       hasReachedEnd: hasReachedLimit || newList.length < _limit,
