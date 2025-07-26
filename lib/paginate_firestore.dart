@@ -98,33 +98,38 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
 
   @override
   Widget build(BuildContext context) {
-    return BlocBuilder<PaginationCubit, PaginationState>(
-      bloc: _cubit,
-      builder: (context, state) {
-        if (state is PaginationInitial) {
-          return widget.initialLoader;
-        } else if (state is PaginationError) {
-          return (widget.onError != null)
-              ? widget.onError!(state.error)
-              : ErrorDisplay(exception: state.error);
-        } else {
-          final loadedState = state as PaginationLoaded;
-          if (widget.onLoaded != null) {
-            widget.onLoaded!(loadedState);
-          }
-          if (loadedState.hasReachedEnd && widget.onReachedEnd != null) {
-            widget.onReachedEnd!(loadedState);
-          }
+    return Builder(
+      builder: (context) {
+        return BlocBuilder<PaginationCubit, PaginationState>(
+          bloc: _cubit,
+          buildWhen: (prev, curr) => prev != curr,
+          builder: (context, state) {
+            if (state is PaginationInitial) {
+              return widget.initialLoader;
+            } else if (state is PaginationError) {
+              return (widget.onError != null)
+                  ? widget.onError!(state.error)
+                  : ErrorDisplay(exception: state.error);
+            } else {
+              final loadedState = state as PaginationLoaded;
+              if (widget.onLoaded != null) {
+                widget.onLoaded!(loadedState);
+              }
+              if (loadedState.hasReachedEnd && widget.onReachedEnd != null) {
+                widget.onReachedEnd!(loadedState);
+              }
 
-          if (loadedState.documentSnapshots.isEmpty) {
-            return widget.onEmpty;
-          }
-          return widget.itemBuilderType == PaginateBuilderType.listView
-              ? _buildListView(loadedState)
-              : widget.itemBuilderType == PaginateBuilderType.gridView
-                  ? _buildGridView(loadedState)
-                  : _buildPageView(loadedState);
-        }
+              if (loadedState.documentSnapshots.isEmpty) {
+                return widget.onEmpty;
+              }
+              return widget.itemBuilderType == PaginateBuilderType.listView
+                  ? _buildListView(loadedState)
+                  : widget.itemBuilderType == PaginateBuilderType.gridView
+                      ? _buildGridView(loadedState)
+                      : _buildPageView(loadedState);
+            }
+          },
+        );
       },
     );
   }
@@ -196,14 +201,18 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               (context, index) {
                 if (index >= loadedState.documentSnapshots.length) {
                   if (!loadedState.hasReachedEnd) {
-                    _cubit!.fetchPaginatedList();
+                    _cubit?.fetchPaginatedList();
                   }
                   return widget.bottomLoader;
                 }
-                return widget.itemBuilder(
-                  context,
-                  loadedState.documentSnapshots,
-                  index,
+                final doc = loadedState.documentSnapshots[index];
+                return KeyedSubtree(
+                  key: ValueKey(doc.id),
+                  child: widget.itemBuilder(
+                    context,
+                    loadedState.documentSnapshots,
+                    index,
+                  ),
                 );
               },
               childCount: loadedState.hasReachedEnd
@@ -249,14 +258,18 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 if (index.isEven) {
                   if (itemIndex >= loadedState.documentSnapshots.length) {
                     if (!loadedState.hasReachedEnd) {
-                      _cubit!.fetchPaginatedList();
+                      _cubit?.fetchPaginatedList();
                     }
                     return widget.bottomLoader;
                   }
-                  return widget.itemBuilder(
-                    context,
-                    loadedState.documentSnapshots,
-                    itemIndex,
+                  final doc = loadedState.documentSnapshots[itemIndex];
+                  return KeyedSubtree(
+                    key: ValueKey(doc.id),
+                    child: widget.itemBuilder(
+                      context,
+                      loadedState.documentSnapshots,
+                      itemIndex,
+                    ),
                   );
                 }
                 return widget.separator;
@@ -310,14 +323,18 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           (context, index) {
             if (index >= loadedState.documentSnapshots.length) {
               if (!loadedState.hasReachedEnd) {
-                _cubit!.fetchPaginatedList();
+                _cubit?.fetchPaginatedList();
               }
               return widget.bottomLoader;
             }
-            return widget.itemBuilder(
-              context,
-              loadedState.documentSnapshots,
-              index,
+            final doc = loadedState.documentSnapshots[index];
+            return KeyedSubtree(
+              key: ValueKey(doc.id),
+              child: widget.itemBuilder(
+                context,
+                loadedState.documentSnapshots,
+                index,
+              ),
             );
           },
           childCount: loadedState.hasReachedEnd
