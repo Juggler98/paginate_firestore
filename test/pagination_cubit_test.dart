@@ -462,4 +462,39 @@ void main() {
     expect(loaded().documentSnapshots[1].data(), {'value': 'New cherry'});
     expect(loaded().documentSnapshots[2].data(), {'value': 'New date'});
   });
+
+  for (final olderReadFails in [false, true]) {
+    test(
+        'retry after a live error ignores a pending read '
+        'that later ${olderReadFails ? 'fails' : 'succeeds'}', () async {
+      cubit = PaginationCubit(store.query, 2, null,
+          isLive: true, isAllItemsLive: false);
+      await load([a, b]);
+      final olderFetch = cubit.fetchPaginatedList();
+      final olderRequest = store.requests.last;
+      store.requests.first.fail(Exception('listener failed'));
+      await pumpEventQueue();
+      expect(cubit.state, isA<PaginationError>());
+
+      final retry = cubit.fetchPaginatedList();
+      expect(identical(cubit.fetchPaginatedList(), retry), isTrue);
+      await pumpEventQueue();
+      expect(store.requests, hasLength(3));
+      expect(store.requests.last.isLive, isTrue);
+      expect(store.requests.last.query.cursor, isNull);
+      store.requests.last.respond([c]);
+      await retry;
+
+      if (olderReadFails) {
+        olderRequest.fail(Exception('stale read failed'));
+      } else {
+        olderRequest.respond([d]);
+      }
+      await olderFetch;
+      expect(paths(), ['items/c']);
+      expect(store.requests.first.cancelled, isTrue);
+      expect(store.requests.last.cancelled, isFalse);
+      expect(store.requests, hasLength(3));
+    });
+  }
 }

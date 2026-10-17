@@ -116,8 +116,10 @@ class PaginationCubit extends Cubit<PaginationState> {
   Future<void> fetchPaginatedList() {
     if (_disposed) return Future.value();
     if (_refreshRequest != null) return _refreshRequest!;
-    if (_request != null) return _request!;
+    // A live listener can fail while a later one-time read is still pending.
+    // Retrying must start a new session rather than wait for that stale read.
     if (_hasError) return refreshPaginatedList();
+    if (_request != null) return _request!;
     if (_hasReachedEnd && state is! PaginationInitial) {
       return Future.value();
     }
