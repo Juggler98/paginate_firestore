@@ -124,6 +124,11 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           bloc: _cubit,
           buildWhen: (prev, curr) => prev != curr,
           listener: (context, state) {
+            if (state is PaginationInitial) {
+              // A previous one-time read may still be in flight. It must not
+              // block the loader in the refreshed pagination session.
+              _nextPageRequest = null;
+            }
             if (state is PaginationLoaded) {
               widget.onLoaded?.call(state);
               if (state.hasReachedEnd) widget.onReachedEnd?.call(state);
@@ -262,6 +267,17 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     }));
   }
 
+  ChildIndexGetter _documentIndexLookup(PaginationLoaded state,
+      {int stride = 1}) {
+    // Keep each item's State attached to its document when live updates or
+    // filtering move it. A map avoids repeated linear searches during layout.
+    final indices = {
+      for (var i = 0; i < state.documentSnapshots.length; i++)
+        ValueKey(state.documentSnapshots[i].reference.path): i * stride,
+    };
+    return (key) => indices[key];
+  }
+
   Widget _buildGridView(PaginationLoaded loadedState) {
     var gridView = CustomScrollView(
       reverse: widget.reverse,
@@ -297,6 +313,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               childCount: loadedState.hasReachedEnd
                   ? loadedState.documentSnapshots.length
                   : loadedState.documentSnapshots.length + 1,
+              findChildIndexCallback: _documentIndexLookup(loadedState),
             ),
           ),
         ),
@@ -358,6 +375,8 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 // ignore: avoid_returning_null
                 return null;
               },
+              findChildIndexCallback:
+                  _documentIndexLookup(loadedState, stride: 2),
               childCount: max(
                   0,
                   (loadedState.hasReachedEnd
@@ -415,6 +434,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           childCount: loadedState.hasReachedEnd
               ? loadedState.documentSnapshots.length
               : loadedState.documentSnapshots.length + 1,
+          findChildIndexCallback: _documentIndexLookup(loadedState),
         ),
       ),
     );

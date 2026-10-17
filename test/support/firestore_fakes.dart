@@ -57,6 +57,7 @@ class RecordedRequest {
   final GetOptions? options;
   final result = Completer<QuerySnapshot<Json>>();
   bool cancelled = false;
+  List<TestDocument> _previousDocuments = [];
   late final stream = StreamController<QuerySnapshot<Json>>(
     onCancel: () => cancelled = true,
   );
@@ -65,7 +66,22 @@ class RecordedRequest {
       {bool fromCache = false,
       bool pendingWrites = false,
       bool metadataOnly = false}) {
+    final previousByPath = {
+      for (var i = 0; i < _previousDocuments.length; i++)
+        _previousDocuments[i].reference.path: i,
+    };
+    final nextPaths = docs.map((doc) => doc.reference.path).toSet();
+    final changes = <TestDocument>[
+      for (var i = 0; i < docs.length; i++)
+        if (previousByPath[docs[i].reference.path] != i ||
+            !identical(_previousDocuments[i], docs[i]))
+          docs[i],
+      for (final previous in _previousDocuments)
+        if (!nextPaths.contains(previous.reference.path)) previous,
+    ];
+    _previousDocuments = docs;
     final snapshot = TestSnapshot(docs,
+        changedDocuments: changes,
         fromCache: fromCache,
         pendingWrites: pendingWrites,
         metadataOnly: metadataOnly);
@@ -112,7 +128,8 @@ class TestSnapshot extends Fake implements QuerySnapshot<Json> {
   TestSnapshot(this.docs,
       {bool fromCache = false,
       bool pendingWrites = false,
-      this.metadataOnly = false})
+      this.metadataOnly = false,
+      this.changedDocuments})
       : metadata = TestMetadata(fromCache, pendingWrites);
 
   @override
@@ -121,13 +138,20 @@ class TestSnapshot extends Fake implements QuerySnapshot<Json> {
   @override
   final SnapshotMetadata metadata;
   final bool metadataOnly;
+  final List<TestDocument>? changedDocuments;
 
   @override
-  List<DocumentChange<Json>> get docChanges =>
-      metadataOnly ? [] : [TestDocumentChange()];
+  List<DocumentChange<Json>> get docChanges => metadataOnly
+      ? []
+      : (changedDocuments ?? docs).map(TestDocumentChange.new).toList();
 }
 
-class TestDocumentChange extends Fake implements DocumentChange<Json> {}
+class TestDocumentChange extends Fake implements DocumentChange<Json> {
+  TestDocumentChange(this.doc);
+
+  @override
+  final TestDocument doc;
+}
 
 class InvalidSnapshot extends TestSnapshot {
   InvalidSnapshot() : super([]);

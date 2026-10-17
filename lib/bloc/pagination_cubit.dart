@@ -230,13 +230,25 @@ class PaginationCubit extends Cubit<PaginationState> {
         page.confirmation = null;
       }
     }
-    final hasDocumentChanges =
-        !page.receivedSnapshot || snapshot.docChanges.isNotEmpty;
+    final changes = snapshot.docChanges;
+    final hasDocumentChanges = !page.receivedSnapshot || changes.isNotEmpty;
     page.receivedSnapshot = true;
     if (hasDocumentChanges || emitMetadata) {
+      if (hasDocumentChanges) {
+        final revision = ++_revision;
+        final changedPaths =
+            changes.map((change) => change.doc.reference.path).toSet();
+        // Only changed documents gain a new revision. An update to another
+        // document on this page must not overwrite a newer overlapping copy.
+        page.documentRevisions = {
+          for (final document in documentsInPage)
+            document.reference.path: changedPaths
+                    .contains(document.reference.path)
+                ? revision
+                : page.documentRevisions[document.reference.path] ?? revision,
+        };
+      }
       page.documents = documentsInPage;
-      // A metadata event must not make stale overlapping data look newer.
-      if (hasDocumentChanges) page.revision = ++_revision;
       _mergePages();
     }
 
@@ -260,10 +272,10 @@ class PaginationCubit extends Cubit<PaginationState> {
     for (final loadedPage in _pages) {
       for (final document in loadedPage.documents) {
         final path = document.reference.path;
-        if (!revisions.containsKey(path) ||
-            revisions[path]! < loadedPage.revision) {
+        final revision = loadedPage.documentRevisions[path]!;
+        if (!revisions.containsKey(path) || revisions[path]! < revision) {
           documents[path] = document;
-          revisions[path] = loadedPage.revision;
+          revisions[path] = revision;
         }
       }
     }
@@ -295,5 +307,5 @@ class _PaginationPage {
   bool cursorIsCurrent = false;
   Completer<void>? confirmation;
   bool receivedSnapshot = false;
-  int revision = 0;
+  Map<String, int> documentRevisions = {};
 }

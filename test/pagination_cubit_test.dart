@@ -447,4 +447,19 @@ void main() {
     expect(store.requests, hasLength(1));
     expect(store.requests.single.cancelled, isTrue);
   });
+
+  test('an unrelated page update does not replace a newer overlapping document',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    await load([c, d]);
+    store.requests.first.respond([b, TestDocument('items/c', 'New cherry')]);
+    await pumpEventQueue();
+    // The second listener has only observed a change to d so far. Its copy
+    // of c must not override the newer c already received on the first page.
+    store.requests.last.respond([c, TestDocument('items/d', 'New date')]);
+    await pumpEventQueue();
+    expect(loaded().documentSnapshots[1].data(), {'value': 'New cherry'});
+    expect(loaded().documentSnapshots[2].data(), {'value': 'New date'});
+  });
 }

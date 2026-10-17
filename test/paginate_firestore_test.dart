@@ -19,6 +19,7 @@ void main() {
     int? globalLimit,
     PaginateBuilderType builderType = PaginateBuilderType.listView,
     PageController? pageController,
+    Widget Function(BuildContext, List<DocumentSnapshot>, int)? itemBuilder,
   }) =>
       MaterialApp(
         home: Scaffold(
@@ -33,8 +34,9 @@ void main() {
             onLoaded: onLoaded,
             options: options,
             itemsGlobalLimit: globalLimit,
-            itemBuilder: (context, docs, index) =>
-                SizedBox(height: 100, child: Text(docs[index].reference.path)),
+            itemBuilder: itemBuilder ??
+                (context, docs, index) => SizedBox(
+                    height: 100, child: Text(docs[index].reference.path)),
           ),
         ),
       );
@@ -229,4 +231,96 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     filter.dispose();
   });
+
+  testWidgets('refresh can paginate while an older read is still pending',
+      (tester) async {
+    final store = RecordingFirestore();
+    final refresh = PaginateRefreshedChangeListener();
+    final a = TestDocument('items/a');
+    final b = TestDocument('items/b');
+    await tester.pumpWidget(buildWidget(store, listeners: [refresh]));
+    store.requests.single.respond([a, b]);
+    await tester.pump();
+    await tester.pump();
+    expect(store.requests, hasLength(2));
+    final oldRead = store.requests.last;
+    refresh.refreshed = true;
+    await tester.pump();
+    await tester.pump();
+    expect(store.requests, hasLength(3));
+    store.requests.last.respond([a, b]);
+    await tester.pump();
+    await tester.pump();
+    expect(store.requests, hasLength(4));
+    expect(store.requests.last.query.cursor, same(b));
+    // Completing the obsolete read must not overwrite the refreshed session.
+    oldRead.respond([TestDocument('items/obsolete')]);
+    store.requests.last.respond([TestDocument('items/current')]);
+    await tester.pumpAndSettle();
+    expect(find.text('items/obsolete'), findsNothing);
+    expect(find.text('items/current'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    refresh.dispose();
+  });
+
+  for (final builderType in PaginateBuilderType.values) {
+    testWidgets('live reordering preserves item state in ${builderType.name}',
+        (tester) async {
+      final store = RecordingFirestore();
+      final controller = PageController();
+      final a = TestDocument('items/a');
+      final b = TestDocument('items/b');
+      await tester.pumpWidget(buildWidget(store,
+          isLive: true,
+          globalLimit: 2,
+          builderType: builderType,
+          pageController: controller,
+          itemBuilder: (context, docs, index) =>
+              CounterItem(path: docs[index].reference.path)));
+      store.requests.single.respond([a, b]);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('items/a: 0'));
+      await tester.pump();
+      expect(find.text('items/a: 1'), findsOneWidget);
+      store.requests.single.respond([b, a]);
+      await tester.pumpAndSettle();
+      if (builderType == PaginateBuilderType.pageView) {
+        controller.jumpToPage(1);
+        await tester.pumpAndSettle();
+      }
+      expect(find.text('items/a: 1'), findsOneWidget);
+      expect(store.requests, hasLength(1));
+      await tester.pumpWidget(const SizedBox());
+      controller.dispose();
+    });
+  }
+}
+
+class CounterItem extends StatefulWidget {
+  const CounterItem({super.key, required this.path});
+
+  final String path;
+
+  @override
+  State<CounterItem> createState() => _CounterItemState();
+}
+
+class _CounterItemState extends State<CounterItem>
+    with AutomaticKeepAliveClientMixin<CounterItem> {
+  int count = 0;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return SizedBox(
+      height: 100,
+      child: TextButton(
+        onPressed: () => setState(() => count++),
+        child: Text('${widget.path}: $count'),
+      ),
+    );
+  }
 }
