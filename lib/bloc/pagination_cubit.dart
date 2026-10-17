@@ -48,8 +48,11 @@ class PaginationCubit extends Cubit<PaginationState> {
       _pages.fold(0, (total, page) => total + page.limit);
 
   bool get _hasReachedEnd =>
-      (itemsGlobalLimit != null && _requestedCount >= itemsGlobalLimit!) ||
-      (_pages.isNotEmpty && _pages.last.hasReachedEnd);
+      itemsGlobalLimit == 0 ||
+      (_pages.isNotEmpty &&
+          _pages.last.confirmed &&
+          ((itemsGlobalLimit != null && _requestedCount >= itemsGlobalLimit!) ||
+              _pages.last.hasReachedEnd));
 
   bool _isCurrent(int generation) =>
       !_disposed && !_hasError && generation == _generation;
@@ -78,7 +81,13 @@ class PaginationCubit extends Cubit<PaginationState> {
     final normalizedTerm = searchTerm.toLowerCase();
     if (_filterTerm == normalizedTerm) return;
     _filterTerm = normalizedTerm;
-    if (!_disposed && state is PaginationLoaded) _emitLoaded();
+    if (!_disposed && state is PaginationLoaded) {
+      try {
+        _emitLoaded();
+      } catch (error) {
+        _handleError(error, _generation);
+      }
+    }
   }
 
   Future<void> refreshPaginatedList() {
@@ -122,6 +131,15 @@ class PaginationCubit extends Cubit<PaginationState> {
   }
 
   Future<void> _fetchPage(int generation) async {
+    // An already loaded live page can later receive pending local writes or
+    // cached updates. Wait for its latest cursor, not just its first snapshot.
+    while (_pages.isNotEmpty && !_pages.last.cursorIsCurrent) {
+      final page = _pages.last;
+      final confirmation = page.confirmation ??= Completer<void>();
+      _pendingSnapshots.add(confirmation);
+      await confirmation.future;
+      if (!_isCurrent(generation)) return;
+    }
     if (_hasReachedEnd) {
       // Match asynchronous query completion so widget listeners can subscribe
       // before a zero-limit request reports that it has loaded.
@@ -152,10 +170,8 @@ class PaginationCubit extends Cubit<PaginationState> {
           try {
             final confirmed = !snapshot.metadata.isFromCache &&
                 !snapshot.metadata.hasPendingWrites;
-            final firstConfirmation = confirmed && !page.confirmed;
             _updatePage(page, snapshot,
-                confirmed: confirmed,
-                emitMetadata: includeMetadataChanges || firstConfirmation);
+                confirmed: confirmed, emitMetadata: includeMetadataChanges);
             if (confirmed && !ready.isCompleted) {
               ready.complete();
               _pendingSnapshots.remove(ready);
@@ -166,6 +182,10 @@ class PaginationCubit extends Cubit<PaginationState> {
           }
         }, onError: (Object error, StackTrace stackTrace) {
           _handleError(error, generation);
+        }, onDone: () {
+          _handleError(
+              StateError('The Firestore listener closed unexpectedly.'),
+              generation);
         });
         _streams.add(listener);
         await ready.future;
@@ -196,23 +216,43 @@ class PaginationCubit extends Cubit<PaginationState> {
     bool emitMetadata = true,
   }) {
     final documentsInPage = snapshot.docs;
-    final wasAtEnd = page.hasReachedEnd;
+    final wasAtEnd = _hasReachedEnd;
+    page.cursorIsCurrent = confirmed;
     if (confirmed) {
       page.confirmed = true;
       page.hasReachedEnd = documentsInPage.length < page.limit;
       // Retain the cursor on an empty result; never restart from page one.
       if (documentsInPage.isNotEmpty) page.cursor = documentsInPage.last;
+      final confirmation = page.confirmation;
+      if (confirmation != null) {
+        confirmation.complete();
+        _pendingSnapshots.remove(confirmation);
+        page.confirmation = null;
+      }
     }
-    if (!emitMetadata &&
-        page.receivedSnapshot &&
-        wasAtEnd == page.hasReachedEnd &&
-        snapshot.docChanges.isEmpty) {
-      return;
-    }
+    final hasDocumentChanges =
+        !page.receivedSnapshot || snapshot.docChanges.isNotEmpty;
     page.receivedSnapshot = true;
-    page.documents = documentsInPage;
-    page.revision = ++_revision;
+    if (hasDocumentChanges || emitMetadata) {
+      page.documents = documentsInPage;
+      // A metadata event must not make stale overlapping data look newer.
+      if (hasDocumentChanges) page.revision = ++_revision;
+      _mergePages();
+    }
 
+    if (hasDocumentChanges ||
+        emitMetadata ||
+        wasAtEnd != _hasReachedEnd ||
+        state is PaginationInitial) {
+      // Only the initial empty cache is inconclusive. Later local deletions
+      // must also be reflected while their writes are still pending.
+      if (_documents.isNotEmpty || confirmed || state is PaginationLoaded) {
+        _emitLoaded();
+      }
+    }
+  }
+
+  void _mergePages() {
     // Full paths also distinguish documents in collection-group queries.
     // When live pages overlap, keep the most recently received document data.
     final documents = <String, DocumentSnapshot>{};
@@ -228,8 +268,6 @@ class PaginationCubit extends Cubit<PaginationState> {
       }
     }
     _documents = documents.values.toList();
-    // Avoid treating an empty local cache as an empty server result.
-    if (_documents.isNotEmpty || confirmed) _emitLoaded();
   }
 
   void _emitLoaded() {
@@ -254,6 +292,8 @@ class _PaginationPage {
   List<QueryDocumentSnapshot> documents = [];
   bool hasReachedEnd = false;
   bool confirmed = false;
+  bool cursorIsCurrent = false;
+  Completer<void>? confirmation;
   bool receivedSnapshot = false;
   int revision = 0;
 }

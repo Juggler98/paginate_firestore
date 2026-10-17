@@ -327,4 +327,124 @@ void main() {
     expect((cubit.state as PaginationError).error, isA<FormatException>());
     expect(store.requests.single.cancelled, isTrue);
   });
+
+  test('a pending final page does not report the global limit as loaded',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null,
+        isLive: true, itemsGlobalLimit: 3);
+    await load([a, b]);
+    final pending = cubit.fetchPaginatedList();
+    store.requests.first.respond([TestDocument('items/a', 'Updated'), b]);
+    await pumpEventQueue();
+    expect(loaded().hasReachedEnd, isFalse);
+    store.requests.last.respond([c]);
+    await pending;
+    expect(loaded().hasReachedEnd, isTrue);
+  });
+
+  test('metadata-only confirmation does not emit unchanged loaded data',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    final states = <PaginationState>[];
+    final subscription = cubit.stream.listen(states.add);
+    final pending = cubit.fetchPaginatedList();
+    store.requests.single.respond([a, b], fromCache: true);
+    await pumpEventQueue();
+    // Real Firestore snapshots wrap the same data in new document objects.
+    store.requests.single.respond([
+      TestDocument('items/a', 'Apple'),
+      TestDocument('items/b', 'Banana'),
+    ], metadataOnly: true);
+    await pending;
+    await pumpEventQueue();
+    expect(states.whereType<PaginationLoaded>(), hasLength(1));
+    await subscription.cancel();
+  });
+
+  test('later local changes must be confirmed before using the tail cursor',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    store.requests.single.respond([a, c], pendingWrites: true);
+    await pumpEventQueue();
+    final next = cubit.fetchPaginatedList();
+    await pumpEventQueue();
+    expect(store.requests, hasLength(1));
+    store.requests.first.respond([a, c], metadataOnly: true);
+    await pumpEventQueue();
+    expect(store.requests, hasLength(2));
+    expect(store.requests.last.query.cursor, same(c));
+    store.requests.last.respond([]);
+    await next;
+  });
+
+  test('empty local updates remove stale rows after initial data was displayed',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a]);
+    store.requests.single.respond([], pendingWrites: true);
+    await pumpEventQueue();
+    expect(paths(), isEmpty);
+    store.requests.single.respond([], metadataOnly: true);
+    await pumpEventQueue();
+    expect(paths(), isEmpty);
+  });
+
+  test('metadata from an overlapping page does not restore older document data',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null,
+        isLive: true, includeMetadataChanges: true);
+    await load([a, b]);
+    await load([c, d]);
+    store.requests.first.respond([b, TestDocument('items/c', 'Updated')]);
+    await pumpEventQueue();
+    store.requests.last.respond([c, d], metadataOnly: true);
+    await pumpEventQueue();
+    expect(loaded().documentSnapshots[1].data(), {'value': 'Updated'});
+  });
+
+  test('refresh cancels a wait for a later cursor confirmation', () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    store.requests.single.respond([a, c], fromCache: true);
+    await pumpEventQueue();
+    final waiting = cubit.fetchPaginatedList();
+    final refresh = cubit.refreshPaginatedList();
+    await waiting;
+    await pumpEventQueue();
+    expect(store.requests, hasLength(2));
+    store.requests.last.respond([d]);
+    await refresh;
+    expect(paths(), ['items/d']);
+  });
+
+  test(
+      'a closed live stream reports an error instead of leaving a pending fetch',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    final pending = cubit.fetchPaginatedList();
+    await store.requests.single.stream.close();
+    await pending;
+    expect(cubit.state, isA<PaginationError>());
+  });
+
+  test('filter conversion errors use the normal error state', () async {
+    cubit = PaginationCubit(store.query, 2, null);
+    await load([InvalidDocument()]);
+    expect(() => cubit.filterPaginatedList('anything'), returnsNormally);
+    expect((cubit.state as PaginationError).error, isA<FormatException>());
+  });
+
+  test('closing releases a pending wait for later cursor confirmation',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    store.requests.single.respond([a, c], fromCache: true);
+    await pumpEventQueue();
+    final waiting = cubit.fetchPaginatedList();
+    await cubit.close();
+    await waiting;
+    expect(store.requests, hasLength(1));
+    expect(store.requests.single.cancelled, isTrue);
+  });
 }

@@ -17,13 +17,16 @@ void main() {
     bool isLive = false,
     GetOptions? options,
     int? globalLimit,
+    PaginateBuilderType builderType = PaginateBuilderType.listView,
+    PageController? pageController,
   }) =>
       MaterialApp(
         home: Scaffold(
           body: PaginateFirestore(
             query: store.query,
             itemsPerPage: pageSize,
-            itemBuilderType: PaginateBuilderType.listView,
+            itemBuilderType: builderType,
+            pageController: pageController,
             listeners: listeners,
             scrollController: controller,
             isLive: isLive,
@@ -178,5 +181,52 @@ void main() {
     expect(find.text('parents/one/items/shared'), findsOneWidget);
     expect(find.text('parents/two/items/shared'), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  for (final builderType in PaginateBuilderType.values) {
+    testWidgets('cached pages resume after confirmation in ${builderType.name}',
+        (tester) async {
+      final store = RecordingFirestore();
+      final a = TestDocument('items/a');
+      final b = TestDocument('items/b');
+      final pageController = PageController(initialPage: 2);
+      var loadedCount = 0;
+      await tester.pumpWidget(buildWidget(store,
+          isLive: true,
+          builderType: builderType,
+          pageController: pageController,
+          onLoaded: (_) => loadedCount++));
+      store.requests.single.respond([a, b], fromCache: true);
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(1));
+      expect(loadedCount, 1);
+      store.requests.single.respond([a, b], metadataOnly: true);
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(2));
+      expect(loadedCount, 1);
+      store.requests.last.respond([]);
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(const SizedBox());
+      pageController.dispose();
+    });
+  }
+
+  testWidgets('removing a filter listener restores the unfiltered list',
+      (tester) async {
+    final store = RecordingFirestore();
+    final filter = PaginateFilterChangeListener()..searchTerm = 'missing';
+    await tester.pumpWidget(buildWidget(store, listeners: [filter]));
+    store.requests.single.respond([TestDocument('items/a', 'apple')]);
+    await tester.pumpAndSettle();
+    expect(find.text('No documents found'), findsOneWidget);
+    await tester.pumpWidget(buildWidget(store));
+    await tester.pumpAndSettle();
+    expect(find.text('items/a'), findsOneWidget);
+    expect(store.requests, hasLength(1));
+    await tester.pumpWidget(const SizedBox());
+    filter.dispose();
   });
 }

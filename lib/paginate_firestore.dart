@@ -1,8 +1,10 @@
 library;
 
+import 'dart:async';
 import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:provider/provider.dart';
@@ -111,6 +113,8 @@ class PaginateFirestore extends StatefulWidget {
 
 class _PaginateFirestoreState extends State<PaginateFirestore> {
   PaginationCubit? _cubit;
+  Future<void>? _nextPageRequest;
+  List<ChangeNotifier> _attachedListeners = [];
 
   @override
   Widget build(BuildContext context) {
@@ -172,6 +176,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     super.didUpdateWidget(oldWidget);
     final oldOptions = oldWidget.options ?? const GetOptions();
     final newOptions = widget.options ?? const GetOptions();
+    var restarted = false;
     if (oldWidget.query != widget.query ||
         oldWidget.itemsPerPage != widget.itemsPerPage ||
         oldWidget.itemsGlobalLimit != widget.itemsGlobalLimit ||
@@ -184,42 +189,47 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             newOptions.serverTimestampBehavior) {
       _cubit?.close();
       _createCubit();
+      restarted = true;
     }
-    for (final remove in _listenerRemovers) {
-      remove();
+    if (restarted || !listEquals(_attachedListeners, widget.listeners ?? [])) {
+      for (final remove in _listenerRemovers) {
+        remove();
+      }
+      _listenerRemovers.clear();
+      _attachListeners();
     }
-    _listenerRemovers.clear();
-    _attachListeners();
   }
 
   void _attachListeners() {
-    if (widget.listeners != null) {
-      for (var listener in widget.listeners!) {
-        VoidCallback remover = () {};
-        if (listener is PaginateRefreshedChangeListener) {
-          void fn() {
-            if (listener.refreshed) {
-              _cubit?.refreshPaginatedList();
-            }
+    _attachedListeners = List.of(widget.listeners ?? []);
+    var initialFilter = '';
+    for (var listener in _attachedListeners) {
+      VoidCallback remover = () {};
+      if (listener is PaginateRefreshedChangeListener) {
+        void fn() {
+          if (listener.refreshed) {
+            _cubit?.refreshPaginatedList();
           }
-
-          listener.addListener(fn);
-          remover = () => listener.removeListener(fn);
-        } else if (listener is PaginateFilterChangeListener) {
-          void fn() {
-            _cubit?.filterPaginatedList(listener.searchTerm);
-          }
-
-          listener.addListener(fn);
-          _cubit?.filterPaginatedList(listener.searchTerm);
-          remover = () => listener.removeListener(fn);
         }
-        _listenerRemovers.add(remover);
+
+        listener.addListener(fn);
+        remover = () => listener.removeListener(fn);
+      } else if (listener is PaginateFilterChangeListener) {
+        void fn() {
+          _cubit?.filterPaginatedList(listener.searchTerm);
+        }
+
+        listener.addListener(fn);
+        initialFilter = listener.searchTerm;
+        remover = () => listener.removeListener(fn);
       }
+      _listenerRemovers.add(remover);
     }
+    _cubit?.filterPaginatedList(initialFilter);
   }
 
   void _createCubit() {
+    _nextPageRequest = null;
     _cubit = PaginationCubit(
       widget.query,
       widget.itemsPerPage,
@@ -230,6 +240,26 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       includeMetadataChanges: widget.includeMetadataChanges,
       options: widget.options,
     )..fetchPaginatedList();
+  }
+
+  void _fetchNextPage() {
+    if (_nextPageRequest != null) return;
+    final cubit = _cubit!;
+    final request = cubit.fetchPaginatedList();
+    _nextPageRequest = request;
+    unawaited(request.then((_) {
+      if (!identical(_nextPageRequest, request)) return;
+      _nextPageRequest = null;
+      final state = cubit.state;
+      if (mounted &&
+          identical(_cubit, cubit) &&
+          state is PaginationLoaded &&
+          !state.hasReachedEnd) {
+        // Server confirmation may contain no data changes. Rebuild the visible
+        // loader so scrolling resumes without emitting a duplicate onLoaded.
+        setState(() {});
+      }
+    }));
   }
 
   Widget _buildGridView(PaginationLoaded loadedState) {
@@ -250,7 +280,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               (context, index) {
                 if (index >= loadedState.documentSnapshots.length) {
                   if (!loadedState.hasReachedEnd) {
-                    _cubit?.fetchPaginatedList();
+                    _fetchNextPage();
                   }
                   return widget.bottomLoader;
                 }
@@ -305,7 +335,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 if (index.isEven) {
                   if (itemIndex >= loadedState.documentSnapshots.length) {
                     if (!loadedState.hasReachedEnd) {
-                      _cubit?.fetchPaginatedList();
+                      _fetchNextPage();
                     }
                     return widget.bottomLoader;
                   }
@@ -368,7 +398,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           (context, index) {
             if (index >= loadedState.documentSnapshots.length) {
               if (!loadedState.hasReachedEnd) {
-                _cubit?.fetchPaginatedList();
+                _fetchNextPage();
               }
               return widget.bottomLoader;
             }

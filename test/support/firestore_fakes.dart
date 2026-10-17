@@ -145,3 +145,10 @@ class TestMetadata extends Fake implements SnapshotMetadata {
   @override
   final bool hasPendingWrites;
 }
+
+class InvalidDocument extends TestDocument {
+  InvalidDocument() : super('items/invalid');
+
+  @override
+  Json data() => throw const FormatException('Invalid converted data');
+}

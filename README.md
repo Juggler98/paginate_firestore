@@ -129,16 +129,25 @@ The package does not automatically requery all loaded pages on every change.
 
 Live listeners can first return an incomplete local cache. Cached documents may
 be displayed, but fetching another page waits for a server-confirmed snapshot
-without pending writes. Internal metadata events allow this confirmation even
+without pending writes, including after later local changes to that page.
+There is no timeout: live pagination can remain waiting while offline.
+Internal metadata events allow this confirmation even
 when the server data is identical; they do not open additional queries. An empty
 cache alone does not show the empty state. For explicit offline browsing use
 `isLive: false` with `options: GetOptions(source: Source.cache)`; its results and
 end-of-list status describe the cache. See
 [Firestore snapshot events](https://firebase.google.com/docs/firestore/query-data/listen).
 
+With `includeMetadataChanges: false`, metadata-only confirmations do not repeat
+`onLoaded` unless they change the end-of-list status. The visible loader resumes
+pagination when confirmation arrives. `onLoaded` and `onReachedEnd` respond to
+loaded state changes, not parent rebuilds; they can still run again after data,
+filter, or end-of-list changes. `onLoaded` may describe cached data.
+
 `PaginateFilterChangeListener` searches **only already loaded documents**, locally,
 without Firestore reads. Changing or clearing the term always uses the full loaded
-list. Use a different Firestore query for server-side filtering; updating `query`
+list. Removing a filter listener also clears its filter. Use a different
+Firestore query for server-side filtering; updating `query`
 or pagination settings restarts the widget automatically. A failed request is
 reported through `onError`; refresh to retry. Controllers and notifier instances
 passed to the widget remain owned by the caller and should be disposed there.
