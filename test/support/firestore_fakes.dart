@@ -20,6 +20,20 @@ class RecordingQuery extends Fake implements Query<Json> {
   final DocumentSnapshot? cursor;
   final int? pageLimit;
 
+  // Match the SDK's value-based query equality, including cursor values.
+  @override
+  bool operator ==(Object other) =>
+      other is RecordingQuery &&
+      identical(store, other.store) &&
+      pageLimit == other.pageLimit &&
+      cursor?.reference.path == other.cursor?.reference.path &&
+      (cursor as TestDocument?)?.value ==
+          (other.cursor as TestDocument?)?.value;
+
+  @override
+  int get hashCode => Object.hash(store, pageLimit, cursor?.reference.path,
+      (cursor as TestDocument?)?.value);
+
   @override
   Query<Json> startAfterDocument(DocumentSnapshot documentSnapshot) =>
       RecordingQuery(store, cursor: documentSnapshot, pageLimit: pageLimit);

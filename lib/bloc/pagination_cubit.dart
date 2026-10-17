@@ -13,11 +13,12 @@ class PaginationCubit extends Cubit<PaginationState> {
     this._limit,
     this._startAfterDocument, {
     this.isLive = false,
-    this.includeMetadataChanges = false,
+    bool includeMetadataChanges = false,
     this.options,
     this.itemsGlobalLimit,
     this.isAllItemsLive = true,
-  })  : assert(_limit > 0),
+  })  : _includeMetadataChanges = includeMetadataChanges,
+        assert(_limit > 0),
         assert(itemsGlobalLimit == null || itemsGlobalLimit >= 0),
         super(PaginationInitial());
 
@@ -25,7 +26,6 @@ class PaginationCubit extends Cubit<PaginationState> {
   final Query _query;
   final DocumentSnapshot? _startAfterDocument;
   final bool isLive;
-  final bool includeMetadataChanges;
   final GetOptions? options;
   final int? itemsGlobalLimit;
   final bool isAllItemsLive;
@@ -33,6 +33,7 @@ class PaginationCubit extends Cubit<PaginationState> {
   // Each listener owns its page. An update to an earlier page must not replace
   // later pages or move the cursor used to fetch the next page.
   final _pages = <_PaginationPage>[];
+  final _requestedQueries = <Query>{};
   final _streams = <StreamSubscription<QuerySnapshot>>[];
   final _pendingSnapshots = <Completer<void>>{};
   List<DocumentSnapshot> _documents = [];
@@ -43,6 +44,15 @@ class PaginationCubit extends Cubit<PaginationState> {
   int _revision = 0;
   bool _disposed = false;
   bool _hasError = false;
+  bool _includeMetadataChanges;
+
+  bool get includeMetadataChanges => _includeMetadataChanges;
+
+  /// Changes event delivery without restarting queries or clearing loaded pages.
+  void updateMetadataChanges(bool value) => _includeMetadataChanges = value;
+
+  /// Includes waiting for a live page's server confirmation.
+  bool get isFetching => _request != null || _refreshRequest != null;
 
   int get _requestedCount =>
       _pages.fold(0, (total, page) => total + page.limit);
@@ -97,6 +107,7 @@ class PaginationCubit extends Cubit<PaginationState> {
     final generation = ++_generation;
     _hasError = false;
     _pages.clear();
+    _requestedQueries.clear();
     _documents = [];
     _request = null;
     emit(PaginationInitial());
@@ -154,12 +165,16 @@ class PaginationCubit extends Cubit<PaginationState> {
         : min(_limit, itemsGlobalLimit! - _requestedCount);
     final cursor = _pages.isEmpty ? _startAfterDocument : _pages.last.cursor;
     final page = _PaginationPage(pageLimit, cursor);
-    _pages.add(page);
 
     try {
       final query =
           (cursor == null ? _query : _query.startAfterDocument(cursor))
               .limit(pageLimit);
+      if (!_requestedQueries.add(query)) {
+        throw StateError(
+            'Pagination did not advance. Refresh before loading more.');
+      }
+      _pages.add(page);
       if (isLive && (_pages.length == 1 || isAllItemsLive)) {
         final ready = Completer<void>();
         _pendingSnapshots.add(ready);

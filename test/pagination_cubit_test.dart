@@ -53,6 +53,38 @@ void main() {
     expect(loaded().hasReachedEnd, isTrue);
   });
 
+  test('a repeated pagination range stops before issuing another query',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    await load([c, d]);
+    // A live tail moves back to a cursor already used by an existing page.
+    store.requests.last.respond([a, TestDocument('items/b', 'Banana')]);
+    await pumpEventQueue();
+    await cubit.fetchPaginatedList();
+    expect(store.requests, hasLength(2));
+    expect(cubit.state, isA<PaginationError>());
+    expect((cubit.state as PaginationError).error.toString(),
+        contains('Pagination did not advance'));
+    expect(store.requests.every((request) => request.cancelled), isTrue);
+  });
+
+  test('a changed cursor value on the same document remains a new range',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    await load([c, d]);
+    final moved = TestDocument('items/b', 'Updated sort value');
+    store.requests.last.respond([c, moved]);
+    await pumpEventQueue();
+    final pending = cubit.fetchPaginatedList();
+    expect(store.requests, hasLength(3));
+    expect(store.requests.last.query.cursor, same(moved));
+    store.requests.last.respond([]);
+    await pending;
+    expect(loaded().hasReachedEnd, isTrue);
+  });
+
   test('global limit reduces the final query rather than overfetching',
       () async {
     cubit = PaginationCubit(store.query, 2, null, itemsGlobalLimit: 3);

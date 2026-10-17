@@ -103,9 +103,21 @@ mean fewer unique displayed documents than the allowance.
 
 Larger pages reduce request/listener count but can fetch documents the user never
 views. Scrolling prefetches when Flutter builds the bottom loader, which can occur
-just before it becomes visible. Avoid `shrinkWrap: true` inside an unbounded outer
-scroll view for large collections: laying out the list can build the loader and
-trigger more pages even without scrolling.
+just before it becomes visible. After the initial page, the widget automatically
+requests at most one next page without another user action. Further pages require
+scrolling the pagination view or pressing **Load more**. Rebuilds, metadata events,
+local filtering, and live updates do not renew this allowance. This prevents small
+rows, filtered-out results, or `shrinkWrap: true` in an outer scroll view from
+automatically draining the collection. Programmatic scrolling does not renew the
+allowance; the **Load more** button remains available.
+
+Errors stop automatic pagination; there is no automatic retry timer or loop.
+An explicit refresh/retry starts a new session. Within each session, requesting
+the exact same page query again reports an error before another Firestore request
+is issued. This catches stalled or cycling cursors; refresh to reconcile live
+page boundaries if it happens. Application callbacks must not repeatedly request
+refresh/retry themselves. These safeguards bound automatic page requests, not
+reads from changes delivered by already active live listeners.
 
 Firestore charges for documents returned and for billable live changes, with
 possible index and security-rule reads. Cursors avoid the skipped-document reads
@@ -143,14 +155,18 @@ With `includeMetadataChanges: false`, metadata-only confirmations do not repeat
 pagination when confirmation arrives. `onLoaded` and `onReachedEnd` respond to
 loaded state changes, not parent rebuilds; they can still run again after data,
 filter, or end-of-list changes. `onLoaded` may describe cached data.
+Changing `includeMetadataChanges` updates event delivery in place, preserving
+loaded pages and subscriptions without restarting queries.
 
 `PaginateFilterChangeListener` searches **only already loaded documents**, locally,
 without Firestore reads. Changing or clearing the term always uses the full loaded
-list. Removing a filter listener also clears its filter. Use a different
-Firestore query for server-side filtering; updating `query`
-or pagination settings restarts the widget automatically. A failed request is
-reported through `onError`; refresh to retry. Controllers and notifier instances
-passed to the widget remain owned by the caller and should be disposed there.
+list. Removing a filter listener also clears its filter. Filtering may expose the
+bottom loader, but the same bounded automatic-loading allowance applies. Use a
+different Firestore query for server-side filtering; updating `query` or
+query-affecting pagination settings restarts the widget automatically. A failed
+request is reported through `onError`; refresh to retry. Controllers and notifier
+instances passed to the widget remain owned by the caller and should be disposed
+there.
 
 ## Contributions
 

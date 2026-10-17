@@ -15,31 +15,244 @@ void main() {
     void Function(PaginationLoaded)? onLoaded,
     int pageSize = 2,
     bool isLive = false,
+    bool includeMetadataChanges = false,
+    bool outerScroll = false,
     GetOptions? options,
     int? globalLimit,
     PaginateBuilderType builderType = PaginateBuilderType.listView,
     PageController? pageController,
     Widget Function(BuildContext, List<DocumentSnapshot>, int)? itemBuilder,
-  }) =>
-      MaterialApp(
-        home: Scaffold(
-          body: PaginateFirestore(
-            query: store.query,
-            itemsPerPage: pageSize,
-            itemBuilderType: builderType,
-            pageController: pageController,
-            listeners: listeners,
-            scrollController: controller,
-            isLive: isLive,
-            onLoaded: onLoaded,
-            options: options,
-            itemsGlobalLimit: globalLimit,
-            itemBuilder: itemBuilder ??
-                (context, docs, index) => SizedBox(
-                    height: 100, child: Text(docs[index].reference.path)),
-          ),
-        ),
-      );
+  }) {
+    final pagination = PaginateFirestore(
+      query: store.query,
+      itemsPerPage: pageSize,
+      itemBuilderType: builderType,
+      pageController: pageController,
+      listeners: listeners,
+      scrollController: controller,
+      isLive: isLive,
+      includeMetadataChanges: includeMetadataChanges,
+      shrinkWrap: outerScroll,
+      onLoaded: onLoaded,
+      options: options,
+      itemsGlobalLimit: globalLimit,
+      itemBuilder: itemBuilder ??
+          (context, docs, index) =>
+              SizedBox(height: 100, child: Text(docs[index].reference.path)),
+    );
+    return MaterialApp(
+      home: Scaffold(
+        body:
+            outerScroll ? SingleChildScrollView(child: pagination) : pagination,
+      ),
+    );
+  }
+
+  for (final builderType in PaginateBuilderType.values) {
+    testWidgets('filtering cannot chain page reads in ${builderType.name}',
+        (tester) async {
+      final store = RecordingFirestore();
+      final filter = PaginateFilterChangeListener()..searchTerm = 'match';
+      final controller = PageController(initialPage: 1);
+      await tester.pumpWidget(buildWidget(store,
+          listeners: [filter],
+          builderType: builderType,
+          pageController: controller));
+      store.requests.single.respond([
+        TestDocument('items/a', 'match'),
+        TestDocument('items/b', 'other'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(2));
+      store.requests.last.respond([
+        TestDocument('items/c', 'other'),
+        TestDocument('items/d', 'other'),
+      ]);
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(store.requests, hasLength(2));
+      expect(find.text('Load more'), findsOneWidget);
+
+      await tester.tap(find.text('Load more'));
+      await tester.pump();
+      expect(store.requests, hasLength(3));
+      store.requests.last.respond([
+        TestDocument('items/e', 'other'),
+        TestDocument('items/f', 'other'),
+      ]);
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(store.requests, hasLength(3));
+      expect(find.text('Load more'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      filter.dispose();
+      controller.dispose();
+    });
+  }
+
+  for (final builderType in [
+    PaginateBuilderType.listView,
+    PaginateBuilderType.gridView,
+  ]) {
+    testWidgets('outer scrolling cannot drain pages in ${builderType.name}',
+        (tester) async {
+      final store = RecordingFirestore();
+      await tester.pumpWidget(
+          buildWidget(store, outerScroll: true, builderType: builderType));
+      store.requests.single.respond([
+        TestDocument('items/a'),
+        TestDocument('items/b'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(2));
+      store.requests.last.respond([
+        TestDocument('items/c'),
+        TestDocument('items/d'),
+      ]);
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(store.requests, hasLength(2));
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets('metadata setting changes keep the existing live session',
+      (tester) async {
+    final store = RecordingFirestore();
+    var loadedCount = 0;
+    Widget widget(bool metadata) => buildWidget(store,
+        isLive: true,
+        globalLimit: 2,
+        includeMetadataChanges: metadata,
+        onLoaded: (_) => loadedCount++);
+    await tester.pumpWidget(widget(false));
+    store.requests.single.respond([
+      TestDocument('items/a'),
+      TestDocument('items/b'),
+    ]);
+    await tester.pumpAndSettle();
+    expect(loadedCount, 1);
+    await tester.pumpWidget(widget(true));
+    store.requests.first.respond([
+      TestDocument('items/a'),
+      TestDocument('items/b'),
+    ], metadataOnly: true);
+    await tester.pumpAndSettle();
+    expect(store.requests, hasLength(1));
+    expect(store.requests.single.cancelled, isFalse);
+    expect(loadedCount, 2);
+    await tester.pumpWidget(widget(false));
+    store.requests.single.respond([
+      TestDocument('items/a'),
+      TestDocument('items/b'),
+    ], metadataOnly: true);
+    await tester.pumpAndSettle();
+    expect(store.requests, hasLength(1));
+    expect(loadedCount, 2);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  for (final isLive in [false, true]) {
+    testWidgets('failed pages never retry on rebuilds (live: $isLive)',
+        (tester) async {
+      final store = RecordingFirestore();
+      final refresh = PaginateRefreshedChangeListener();
+      Widget widget(bool metadata) => buildWidget(store,
+          isLive: isLive,
+          includeMetadataChanges: metadata,
+          listeners: [refresh]);
+      await tester.pumpWidget(widget(false));
+      store.requests.single.respond([
+        TestDocument('items/a'),
+        TestDocument('items/b'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(2));
+      store.requests.last.fail(Exception('denied'));
+      await tester.pumpAndSettle();
+      for (var i = 0; i < 20; i++) {
+        await tester.pumpWidget(widget(i.isEven));
+        await tester.pump(const Duration(seconds: 1));
+      }
+      expect(store.requests, hasLength(2));
+      expect(find.text('Error occurred: Exception: denied'), findsOneWidget);
+
+      // One explicit retry makes one attempt; a second failure stays stopped.
+      refresh.refreshed = true;
+      await tester.pump();
+      expect(store.requests, hasLength(3));
+      store.requests.last.fail(Exception('still denied'));
+      await tester.pumpAndSettle();
+      for (var i = 0; i < 20; i++) {
+        await tester.pump(const Duration(seconds: 1));
+      }
+      expect(store.requests, hasLength(3));
+      expect(
+          find.text('Error occurred: Exception: still denied'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      refresh.dispose();
+    });
+  }
+
+  for (final builderType in PaginateBuilderType.values) {
+    testWidgets(
+        'live events stay bounded and user scrolling resumes '
+        'in ${builderType.name}', (tester) async {
+      final store = RecordingFirestore();
+      final filter = PaginateFilterChangeListener()..searchTerm = 'match';
+      final controller = PageController(initialPage: 1);
+      Widget widget() => buildWidget(store,
+          isLive: true,
+          includeMetadataChanges: true,
+          listeners: [filter],
+          builderType: builderType,
+          pageController: controller);
+      await tester.pumpWidget(widget());
+      store.requests.single.respond([
+        TestDocument('items/a', 'match'),
+        TestDocument('items/b', 'other'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(2));
+      store.requests.last.respond([
+        TestDocument('items/c', 'other'),
+        TestDocument('items/d', 'other'),
+      ]);
+      await tester.pumpAndSettle();
+      for (var i = 0; i < 10; i++) {
+        store.requests.last.respond([
+          TestDocument('items/c', 'other'),
+          TestDocument('items/d', 'other'),
+        ], metadataOnly: i.isEven);
+        await tester.pumpWidget(widget());
+        await tester.pump();
+      }
+      expect(store.requests, hasLength(2));
+      expect(find.text('Load more'), findsOneWidget);
+
+      await tester.drag(find.byType(Scrollable).first, const Offset(0, -150));
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(3));
+      store.requests.last.respond([
+        TestDocument('items/e', 'other'),
+        TestDocument('items/f', 'other'),
+      ]);
+      await tester.pumpAndSettle();
+      expect(store.requests, hasLength(3));
+      expect(find.text('Load more'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      filter.dispose();
+      controller.dispose();
+    });
+  }
 
   testWidgets('parent rebuilds do not repeat reads or loaded callbacks',
       (tester) async {
