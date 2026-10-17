@@ -26,9 +26,7 @@ class PaginateFilterChangeListener extends PaginateChangeListener {
 
   set searchTerm(String value) {
     _filterTerm = value;
-    if (value.isNotEmpty) {
-      notifyListeners();
-    }
+    notifyListeners();
   }
 
   String get searchTerm {

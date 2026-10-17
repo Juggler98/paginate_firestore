@@ -46,7 +46,7 @@ Implement it
             subtitle: Text(documentSnapshots[index].id),
           );
         },
-        // orderBy is compulsory to enable pagination
+           // Use a stable ordering for predictable pagination
         query: FirebaseFirestore.instance.collection('users').orderBy('name'),
         //Change types accordingly
         itemBuilderType: PaginateBuilderType.listView,
@@ -64,11 +64,12 @@ To use with listeners:
         child: PaginateFirestore(
           itemBuilder: (context, documentSnapshots, index) => ListTile(
             leading: CircleAvatar(child: Icon(Icons.person)),
-            title: Text(documentSnapshots[index].data()['name']),
+            title: Text((documentSnapshots[index].data() as Map)['name']),
             subtitle: Text(documentSnapshots[index].id),
           ),
-          // orderBy is compulsary to enable pagination
-          query: Firestore.instance.collection('users').orderBy('name'),
+          // Use a stable ordering for predictable pagination
+          query: FirebaseFirestore.instance.collection('users').orderBy('name'),
+          itemBuilderType: PaginateBuilderType.listView,
           listeners: [
             refreshChangeListener,
           ],
@@ -78,6 +79,69 @@ To use with listeners:
         },
       )
 ```
+
+## Pagination behavior and Firestore reads
+
+Pages use `startAfterDocument` and `limit`, so scrolling fetches the next page
+without fetching all previous pages again. Concurrent fetch calls share one
+request. A refresh cancels existing listeners and starts again from the original
+cursor; results from older requests are ignored. Refreshing deliberately reads
+the first page again.
+
+`itemsGlobalLimit` caps the total document slots requested across pages. For
+example, `itemsPerPage: 15` and `itemsGlobalLimit: 25` request 15 documents, then
+10, and stop. A limit of zero makes no query. Filtering and live deletions do not
+reset this allowance. It is **not a billing cap**: subsequent live updates,
+refreshes and reconnects can cause more reads. Overlapping live pages can also
+mean fewer unique displayed documents than the allowance.
+
+| Configuration | Read behavior |
+| --- | --- |
+| `isLive: false` (default) | One `get()` per requested page. Best when refresh-on-demand is sufficient. |
+| `isLive: true, isAllItemsLive: false` | One listener on the first page; later pages use `get()`. Historical pages remain unchanged until refresh. |
+| `isLive: true, isAllItemsLive: true` (default for live mode) | One listener per requested page; updates to loaded pages stay visible. |
+
+Larger pages reduce request/listener count but can fetch documents the user never
+views. Scrolling prefetches when Flutter builds the bottom loader, which can occur
+just before it becomes visible. Avoid `shrinkWrap: true` inside an unbounded outer
+scroll view for large collections: laying out the list can build the loader and
+trigger more pages even without scrolling.
+
+Firestore charges for documents returned and for billable live changes, with
+possible index and security-rule reads. Cursors avoid the skipped-document reads
+incurred by offsets. A short page marks the end; an exactly full final page needs
+one subsequent empty query to discover the end unless a global limit was reached.
+Even an empty query has a minimum one-document read charge. Reconnecting listeners
+can incur fresh-query charges depending on persistence and disconnect duration.
+See [Firestore billing](https://firebase.google.com/docs/firestore/pricing).
+
+### Live pagination boundaries
+
+Every live page has its own fixed start cursor and limit. Updates to an earlier
+page preserve later loaded pages and their pagination cursor. However, inserts,
+deletes, or changes to ordered fields can move documents across these fixed
+boundaries, causing overlaps or gaps. Duplicates are removed by full document
+path, including for collection-group queries. **Refresh to reconcile page
+membership after such changes.** First-page-only live mode has the same boundary
+limitation, including for new messages in a descending chat feed. Prefer immutable
+sort fields, and use one-time pagination when a stable browsing session matters.
+The package does not automatically requery all loaded pages on every change.
+
+Live listeners can first return an incomplete local cache. Cached documents may
+be displayed, but fetching another page waits for a server-confirmed snapshot
+without pending writes. Internal metadata events allow this confirmation even
+when the server data is identical; they do not open additional queries. An empty
+cache alone does not show the empty state. For explicit offline browsing use
+`isLive: false` with `options: GetOptions(source: Source.cache)`; its results and
+end-of-list status describe the cache. See
+[Firestore snapshot events](https://firebase.google.com/docs/firestore/query-data/listen).
+
+`PaginateFilterChangeListener` searches **only already loaded documents**, locally,
+without Firestore reads. Changing or clearing the term always uses the full loaded
+list. Use a different Firestore query for server-side filtering; updating `query`
+or pagination settings restarts the widget automatically. A failed request is
+reported through `onError`; refresh to retry. Controllers and notifier instances
+passed to the widget remain owned by the caller and should be disposed there.
 
 ## Contributions
 

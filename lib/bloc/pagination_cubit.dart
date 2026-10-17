@@ -1,9 +1,9 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:bloc/bloc.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
 
 part 'pagination_state.dart';
 
@@ -17,9 +17,10 @@ class PaginationCubit extends Cubit<PaginationState> {
     this.options,
     this.itemsGlobalLimit,
     this.isAllItemsLive = true,
-  }) : super(PaginationInitial());
+  })  : assert(_limit > 0),
+        assert(itemsGlobalLimit == null || itemsGlobalLimit >= 0),
+        super(PaginationInitial());
 
-  DocumentSnapshot? _lastDocument;
   final int _limit;
   final Query _query;
   final DocumentSnapshot? _startAfterDocument;
@@ -29,162 +30,230 @@ class PaginationCubit extends Cubit<PaginationState> {
   final int? itemsGlobalLimit;
   final bool isAllItemsLive;
 
+  // Each listener owns its page. An update to an earlier page must not replace
+  // later pages or move the cursor used to fetch the next page.
+  final _pages = <_PaginationPage>[];
   final _streams = <StreamSubscription<QuerySnapshot>>[];
+  final _pendingSnapshots = <Completer<void>>{};
+  List<DocumentSnapshot> _documents = [];
+  Future<void>? _request;
+  Future<void>? _refreshRequest;
+  String _filterTerm = '';
+  int _generation = 0;
+  int _revision = 0;
+  bool _disposed = false;
+  bool _hasError = false;
+
+  int get _requestedCount =>
+      _pages.fold(0, (total, page) => total + page.limit);
+
+  bool get _hasReachedEnd =>
+      (itemsGlobalLimit != null && _requestedCount >= itemsGlobalLimit!) ||
+      (_pages.isNotEmpty && _pages.last.hasReachedEnd);
+
+  bool _isCurrent(int generation) =>
+      !_disposed && !_hasError && generation == _generation;
 
   @override
-  Future<void> close() {
-    _clearStreams();
-    return super.close();
+  Future<void> close() async {
+    _disposed = true;
+    _generation++;
+    await _clearStreams();
+    await super.close();
   }
 
-  void _clearStreams() {
-    for (var stream in _streams) {
-      stream.cancel();
-    }
+  Future<void> _clearStreams() async {
+    final streams = List.of(_streams);
     _streams.clear();
-  }
-
-  void filterPaginatedList(String searchTerm) {
-    if (state is PaginationLoaded) {
-      final loadedState = state as PaginationLoaded;
-
-      final filteredList = loadedState.documentSnapshots
-          .where((document) => document
-              .data()
-              .toString()
-              .toLowerCase()
-              .contains(searchTerm.toLowerCase()))
-          .toList();
-
-      emit(loadedState.copyWith(
-        documentSnapshots: filteredList,
-        hasReachedEnd: loadedState.hasReachedEnd,
-      ));
+    for (final pending in _pendingSnapshots) {
+      if (!pending.isCompleted) pending.complete();
     }
+    _pendingSnapshots.clear();
+    await Future.wait(streams.map((stream) => stream.cancel()));
   }
 
-  Future<void> refreshPaginatedList() async {
-    _clearStreams();
-    _lastDocument = null;
-    final localQuery = _getQuery();
+  /// Filters only documents already loaded, without issuing Firestore reads.
+  /// An empty term restores the unfiltered list.
+  void filterPaginatedList(String searchTerm) {
+    final normalizedTerm = searchTerm.toLowerCase();
+    if (_filterTerm == normalizedTerm) return;
+    _filterTerm = normalizedTerm;
+    if (!_disposed && state is PaginationLoaded) _emitLoaded();
+  }
+
+  Future<void> refreshPaginatedList() {
+    if (_disposed) return Future.value();
+    if (_refreshRequest != null) return _refreshRequest!;
+
+    final generation = ++_generation;
+    _hasError = false;
+    _pages.clear();
+    _documents = [];
+    _request = null;
+    emit(PaginationInitial());
+
+    late final Future<void> request;
+    request = _clearStreams().then((_) async {
+      if (_isCurrent(generation)) await _fetchPage(generation);
+    }).whenComplete(() {
+      if (identical(_refreshRequest, request)) _refreshRequest = null;
+    });
+    _refreshRequest = request;
+    return request;
+  }
+
+  /// Concurrent calls share the same request, including while a live listener
+  /// is waiting for its first server-confirmed snapshot.
+  Future<void> fetchPaginatedList() {
+    if (_disposed) return Future.value();
+    if (_refreshRequest != null) return _refreshRequest!;
+    if (_request != null) return _request!;
+    if (_hasError) return refreshPaginatedList();
+    if (_hasReachedEnd && state is! PaginationInitial) {
+      return Future.value();
+    }
+
+    late final Future<void> request;
+    request = _fetchPage(_generation).whenComplete(() {
+      if (identical(_request, request)) _request = null;
+    });
+    _request = request;
+    return request;
+  }
+
+  Future<void> _fetchPage(int generation) async {
+    if (_hasReachedEnd) {
+      // Match asynchronous query completion so widget listeners can subscribe
+      // before a zero-limit request reports that it has loaded.
+      await Future<void>.value();
+      if (_isCurrent(generation)) _emitLoaded();
+      return;
+    }
+    final pageLimit = itemsGlobalLimit == null
+        ? _limit
+        : min(_limit, itemsGlobalLimit! - _requestedCount);
+    final cursor = _pages.isEmpty ? _startAfterDocument : _pages.last.cursor;
+    final page = _PaginationPage(pageLimit, cursor);
+    _pages.add(page);
+
     try {
-      if (isLive) {
-        final listener = localQuery
-            .snapshots(includeMetadataChanges: includeMetadataChanges)
-            .listen((querySnapshot) {
-          _emitPaginatedState(querySnapshot.docs);
+      final query =
+          (cursor == null ? _query : _query.startAfterDocument(cursor))
+              .limit(pageLimit);
+      if (isLive && (_pages.length == 1 || isAllItemsLive)) {
+        final ready = Completer<void>();
+        _pendingSnapshots.add(ready);
+        final listener = query
+            // A cache snapshot can be incomplete. Metadata events let us wait
+            // for confirmation even when the server returns identical data.
+            .snapshots(includeMetadataChanges: true)
+            .listen((snapshot) {
+          if (!_isCurrent(generation)) return;
+          try {
+            final confirmed = !snapshot.metadata.isFromCache &&
+                !snapshot.metadata.hasPendingWrites;
+            final firstConfirmation = confirmed && !page.confirmed;
+            _updatePage(page, snapshot,
+                confirmed: confirmed,
+                emitMetadata: includeMetadataChanges || firstConfirmation);
+            if (confirmed && !ready.isCompleted) {
+              ready.complete();
+              _pendingSnapshots.remove(ready);
+            }
+          } catch (error) {
+            // Converter failures happen inside the data callback, not onError.
+            _handleError(error, generation);
+          }
+        }, onError: (Object error, StackTrace stackTrace) {
+          _handleError(error, generation);
         });
         _streams.add(listener);
+        await ready.future;
       } else {
-        final querySnapshot = await localQuery.get(options);
-        _emitPaginatedState(querySnapshot.docs);
-      }
-    } catch (error, stackTrace) {
-      if (kDebugMode) {
-        debugPrintStack(label: error.toString(), stackTrace: stackTrace);
-      }
-    }
-  }
-
-  bool _isFetching = false;
-
-  void fetchPaginatedList() async {
-    if (_isFetching) {
-      return;
-    }
-    _isFetching = true;
-    try {
-      if (state is PaginationInitial) {
-        await refreshPaginatedList();
-      } else if (state is PaginationLoaded) {
-        if (isLive && isAllItemsLive) {
-          await _getLiveDocuments();
-        } else {
-          await _getDocuments();
+        final snapshot = await query.get(options);
+        if (_isCurrent(generation)) {
+          _updatePage(page, snapshot, confirmed: true);
         }
       }
-    } catch (error, stackTrace) {
-      if (kDebugMode) {
-        debugPrintStack(label: error.toString(), stackTrace: stackTrace);
-      }
-    } finally {
-      _isFetching = false;
+    } catch (error) {
+      _handleError(error, generation);
     }
   }
 
-  Future<void> _getDocuments() async {
-    final localQuery = _getQuery();
-    try {
-      final loadedState = state as PaginationLoaded;
-      if (loadedState.hasReachedEnd) {
-        return;
-      }
-      final querySnapshot = await localQuery.get(options);
-      _emitPaginatedState(
-        querySnapshot.docs,
-        previousList:
-            loadedState.documentSnapshots as List<QueryDocumentSnapshot>,
-      );
-    } on PlatformException catch (exception) {
-      if (kDebugMode) {
-        print(exception);
-      }
-    }
+  void _handleError(Object error, int generation) {
+    if (!_isCurrent(generation)) return;
+    _hasError = true;
+    emit(PaginationError(
+      error: error is Exception ? error : Exception(error.toString()),
+    ));
+    unawaited(_clearStreams());
   }
 
-  Future<void> _getLiveDocuments() async {
-    final localQuery = _getQuery();
-    PaginationLoaded loadedState = state as PaginationLoaded;
-    if (loadedState.hasReachedEnd) {
-      return;
-    }
-    final previousList =
-        loadedState.documentSnapshots as List<QueryDocumentSnapshot>;
-    final listener = localQuery
-        .snapshots(includeMetadataChanges: includeMetadataChanges)
-        .listen((querySnapshot) {
-      _emitPaginatedState(
-        querySnapshot.docs,
-        previousList: previousList,
-      );
-    });
-    _streams.add(listener);
-  }
-
-  void _emitPaginatedState(
-    List<QueryDocumentSnapshot> newList, {
-    List<QueryDocumentSnapshot> previousList = const [],
+  void _updatePage(
+    _PaginationPage page,
+    QuerySnapshot snapshot, {
+    required bool confirmed,
+    bool emitMetadata = true,
   }) {
-    if (isClosed) {
+    final documentsInPage = snapshot.docs;
+    final wasAtEnd = page.hasReachedEnd;
+    if (confirmed) {
+      page.confirmed = true;
+      page.hasReachedEnd = documentsInPage.length < page.limit;
+      // Retain the cursor on an empty result; never restart from page one.
+      if (documentsInPage.isNotEmpty) page.cursor = documentsInPage.last;
+    }
+    if (!emitMetadata &&
+        page.receivedSnapshot &&
+        wasAtEnd == page.hasReachedEnd &&
+        snapshot.docChanges.isEmpty) {
       return;
     }
-    _lastDocument = newList.isNotEmpty ? newList.last : null;
-    final mergedList = _mergeSnapshots(previousList, newList);
-    final hasReachedLimit =
-        itemsGlobalLimit != null && mergedList.length >= itemsGlobalLimit!;
+    page.receivedSnapshot = true;
+    page.documents = documentsInPage;
+    page.revision = ++_revision;
+
+    // Full paths also distinguish documents in collection-group queries.
+    // When live pages overlap, keep the most recently received document data.
+    final documents = <String, DocumentSnapshot>{};
+    final revisions = <String, int>{};
+    for (final loadedPage in _pages) {
+      for (final document in loadedPage.documents) {
+        final path = document.reference.path;
+        if (!revisions.containsKey(path) ||
+            revisions[path]! < loadedPage.revision) {
+          documents[path] = document;
+          revisions[path] = loadedPage.revision;
+        }
+      }
+    }
+    _documents = documents.values.toList();
+    // Avoid treating an empty local cache as an empty server result.
+    if (_documents.isNotEmpty || confirmed) _emitLoaded();
+  }
+
+  void _emitLoaded() {
+    final documents = _filterTerm.isEmpty
+        ? _documents
+        : _documents
+            .where((document) =>
+                document.data().toString().toLowerCase().contains(_filterTerm))
+            .toList();
     emit(PaginationLoaded(
-      documentSnapshots: _mergeSnapshots(previousList, newList),
-      hasReachedEnd: hasReachedLimit || newList.length < _limit,
+      documentSnapshots: List.unmodifiable(documents),
+      hasReachedEnd: _hasReachedEnd,
     ));
   }
+}
 
-  List<QueryDocumentSnapshot> _mergeSnapshots(
-    List<QueryDocumentSnapshot> previousList,
-    List<QueryDocumentSnapshot> newList,
-  ) {
-    final prevIds = previousList.map((doc) => doc.id).toSet();
-    final filteredNew =
-        newList.where((doc) => !prevIds.contains(doc.id)).toList();
-    return [...previousList, ...filteredNew];
-  }
+class _PaginationPage {
+  _PaginationPage(this.limit, this.cursor);
 
-  Query _getQuery() {
-    var localQuery = (_lastDocument != null)
-        ? _query.startAfterDocument(_lastDocument!)
-        : _startAfterDocument != null
-            ? _query.startAfterDocument(_startAfterDocument!)
-            : _query;
-    localQuery = localQuery.limit(_limit);
-    return localQuery;
-  }
+  final int limit;
+  DocumentSnapshot? cursor;
+  List<QueryDocumentSnapshot> documents = [];
+  bool hasReachedEnd = false;
+  bool confirmed = false;
+  bool receivedSnapshot = false;
+  int revision = 0;
 }

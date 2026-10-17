@@ -50,7 +50,8 @@ class PaginateFirestore extends StatefulWidget {
     this.isAllItemsLive = true,
     this.includeMetadataChanges = false,
     this.options,
-  });
+  })  : assert(itemsPerPage > 0),
+        assert(itemsGlobalLimit == null || itemsGlobalLimit >= 0);
 
   final Widget bottomLoader;
   final Widget onEmpty;
@@ -75,18 +76,20 @@ class PaginateFirestore extends StatefulWidget {
   final Widget? header;
   final Widget? footer;
 
-  /// Set maximum documents which can be fetched.
-  /// The pagination will stop when this limit is reached even when there are more elements.
-  /// Example: Paginate up to 1000 items, then stop loading.
+  /// Maximum document slots requested across pages, including the first page.
+  /// The final query is limited to the remaining allowance. Zero issues no reads.
+  /// This does not cap reads billed for live updates, reconnects, or refreshes.
   final int? itemsGlobalLimit;
 
   /// Use this only if `isLive = true`
-  /// If set to true the stream will be listening to all items.
-  /// If false, only the first page is live. This is useful for saving reads, when items doesn't change but the new ones are coming (like in chat).
-  /// default is true, so keep in mind, that for each page new listener is created. Therefore when this is true set itemsPerPage to higher value to reduce listeners count.
+  /// If true (the default), each fetched page has a live listener.
+  /// If false, only the first page is live; later pages use one-time reads.
+  /// Pages have fixed start cursors and limits. Inserts, deletes, or changes to
+  /// sort fields can move documents between pages; refresh to reconcile them.
+  /// Larger pages reduce listener count but can read more unseen documents.
   final bool isAllItemsLive;
 
-  /// Use this only if `isLive = false`
+  /// Options for one-time reads, including later pages when only page one is live.
   final GetOptions? options;
 
   /// Use this only if `isLive = true`
@@ -113,9 +116,15 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   Widget build(BuildContext context) {
     return Builder(
       builder: (context) {
-        return BlocBuilder<PaginationCubit, PaginationState>(
+        return BlocConsumer<PaginationCubit, PaginationState>(
           bloc: _cubit,
           buildWhen: (prev, curr) => prev != curr,
+          listener: (context, state) {
+            if (state is PaginationLoaded) {
+              widget.onLoaded?.call(state);
+              if (state.hasReachedEnd) widget.onReachedEnd?.call(state);
+            }
+          },
           builder: (context, state) {
             if (state is PaginationInitial) {
               return widget.initialLoader;
@@ -125,13 +134,6 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                   : ErrorDisplay(exception: state.error);
             } else {
               final loadedState = state as PaginationLoaded;
-              if (widget.onLoaded != null) {
-                widget.onLoaded!(loadedState);
-              }
-              if (loadedState.hasReachedEnd && widget.onReachedEnd != null) {
-                widget.onReachedEnd!(loadedState);
-              }
-
               if (loadedState.documentSnapshots.isEmpty) {
                 return widget.onEmpty;
               }
@@ -152,7 +154,6 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     for (var remove in _listenerRemovers) {
       remove();
     }
-    widget.scrollController?.dispose();
     _cubit?.close();
     super.dispose();
   }
@@ -162,6 +163,36 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   @override
   void initState() {
     super.initState();
+    _createCubit();
+    _attachListeners();
+  }
+
+  @override
+  void didUpdateWidget(covariant PaginateFirestore oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldOptions = oldWidget.options ?? const GetOptions();
+    final newOptions = widget.options ?? const GetOptions();
+    if (oldWidget.query != widget.query ||
+        oldWidget.itemsPerPage != widget.itemsPerPage ||
+        oldWidget.itemsGlobalLimit != widget.itemsGlobalLimit ||
+        oldWidget.startAfterDocument != widget.startAfterDocument ||
+        oldWidget.isLive != widget.isLive ||
+        oldWidget.isAllItemsLive != widget.isAllItemsLive ||
+        oldWidget.includeMetadataChanges != widget.includeMetadataChanges ||
+        oldOptions.source != newOptions.source ||
+        oldOptions.serverTimestampBehavior !=
+            newOptions.serverTimestampBehavior) {
+      _cubit?.close();
+      _createCubit();
+    }
+    for (final remove in _listenerRemovers) {
+      remove();
+    }
+    _listenerRemovers.clear();
+    _attachListeners();
+  }
+
+  void _attachListeners() {
     if (widget.listeners != null) {
       for (var listener in widget.listeners!) {
         VoidCallback remover = () {};
@@ -176,18 +207,19 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           remover = () => listener.removeListener(fn);
         } else if (listener is PaginateFilterChangeListener) {
           void fn() {
-            if (listener.searchTerm.isNotEmpty) {
-              _cubit?.filterPaginatedList(listener.searchTerm);
-            }
+            _cubit?.filterPaginatedList(listener.searchTerm);
           }
 
           listener.addListener(fn);
+          _cubit?.filterPaginatedList(listener.searchTerm);
           remover = () => listener.removeListener(fn);
         }
         _listenerRemovers.add(remover);
       }
     }
+  }
 
+  void _createCubit() {
     _cubit = PaginationCubit(
       widget.query,
       widget.itemsPerPage,
@@ -224,7 +256,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 }
                 final doc = loadedState.documentSnapshots[index];
                 return KeyedSubtree(
-                  key: ValueKey(doc.id),
+                  key: ValueKey(doc.reference.path),
                   child: widget.itemBuilder(
                     context,
                     loadedState.documentSnapshots,
@@ -245,9 +277,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     if (widget.listeners != null && widget.listeners!.isNotEmpty) {
       return MultiProvider(
         providers: widget.listeners!
-            .map((listener) => ChangeNotifierProvider(
-                  create: (context) => listener,
-                ))
+            .map((listener) => ChangeNotifierProvider.value(value: listener))
             .toList(),
         child: gridView,
       );
@@ -281,7 +311,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                   }
                   final doc = loadedState.documentSnapshots[itemIndex];
                   return KeyedSubtree(
-                    key: ValueKey(doc.id),
+                    key: ValueKey(doc.reference.path),
                     child: widget.itemBuilder(
                       context,
                       loadedState.documentSnapshots,
@@ -315,9 +345,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     if (widget.listeners != null && widget.listeners!.isNotEmpty) {
       return MultiProvider(
         providers: widget.listeners!
-            .map((listener) => ChangeNotifierProvider(
-                  create: (context) => listener,
-                ))
+            .map((listener) => ChangeNotifierProvider.value(value: listener))
             .toList(),
         child: listView,
       );
@@ -346,7 +374,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             }
             final doc = loadedState.documentSnapshots[index];
             return KeyedSubtree(
-              key: ValueKey(doc.id),
+              key: ValueKey(doc.reference.path),
               child: widget.itemBuilder(
                 context,
                 loadedState.documentSnapshots,
@@ -364,9 +392,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     if (widget.listeners != null && widget.listeners!.isNotEmpty) {
       return MultiProvider(
         providers: widget.listeners!
-            .map((listener) => ChangeNotifierProvider(
-                  create: (context) => listener,
-                ))
+            .map((listener) => ChangeNotifierProvider.value(value: listener))
             .toList(),
         child: pageView,
       );
