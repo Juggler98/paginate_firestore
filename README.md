@@ -112,12 +112,45 @@ automatically draining the collection. Programmatic scrolling does not renew the
 allowance; the **Load more** button remains available.
 
 Errors stop automatic pagination; there is no automatic retry timer or loop.
-An explicit refresh/retry starts a new session. Within each session, requesting
-the exact same page query again reports an error before another Firestore request
-is issued. This catches stalled or cycling cursors; refresh to reconcile live
-page boundaries if it happens. Application callbacks must not repeatedly request
-refresh/retry themselves. These safeguards bound automatic page requests, not
-reads from changes delivered by already active live listeners.
+An explicit **retry** requests one failed page, using its original query, cursor,
+and limit. Successful pages and healthy live listeners are retained.
+Concurrent retries share one operation; retrying without an error makes no query.
+If several live pages fail, each requires a separate retry; there is no batch
+recovery. Successful recovery does not grant another automatic page fetch.
+Local filtering errors are retried locally, without Firestore reads.
+An explicit **refresh** still starts a new session and rereads the first page.
+
+For widget error recovery, create a `PaginateRetryChangeListener` once in the
+owning State, add it to `listeners`, and call `retry()` from your error button:
+
+```dart
+final retryListener = PaginateRetryChangeListener(); // Owned by your State.
+
+// In PaginateFirestore:
+listeners: [retryListener],
+onError: (error) => TextButton(
+  onPressed: retryListener.retry,
+  child: const Text('Retry'),
+),
+```
+
+Dispose the notifier in its owner. Existing error buttons that set
+`PaginateRefreshedChangeListener.refreshed = true` still refresh everything;
+use the retry notifier to retain successful pages. Direct cubit users can call
+`retryPaginatedList()`; `fetchPaginatedList()` also retries one failed page when in
+an error state.
+
+Healthy live listeners keep receiving updates while another page has an error,
+so their normal live-update reads still apply. Retry reattaches only the failed
+listener and may reread that page. Fixed live page boundaries still apply.
+
+Within each session, attempting to create another page with an already-requested
+query reports an error before another Firestore request is issued. Explicit
+retries of failed pages are the only exception. Stalled/cycling cursors and query
+construction errors require an explicit refresh or corrected settings, rather
+than a page retry. Application callbacks must not repeatedly request refresh or
+retry themselves. These safeguards bound automatic page requests, not reads from
+changes delivered by already active live listeners.
 
 Firestore charges for documents returned and for billable live changes, with
 possible index and security-rule reads. Cursors avoid the skipped-document reads
@@ -163,10 +196,13 @@ without Firestore reads. Changing or clearing the term always uses the full load
 list. Removing a filter listener also clears its filter. Filtering may expose the
 bottom loader, but the same bounded automatic-loading allowance applies. Use a
 different Firestore query for server-side filtering; updating `query` or
-query-affecting pagination settings restarts the widget automatically. A failed
-request is reported through `onError`; refresh to retry. Controllers and notifier
-instances passed to the widget remain owned by the caller and should be disposed
-there.
+query-affecting pagination settings restarts the widget automatically. Equivalent
+starting-cursor snapshots (same document path and ordered values) keep the current
+session. Changing `isAllItemsLive` while live mode is off, or `GetOptions` while
+all pages are live, also leaves the session intact because those settings are
+unused in those modes. A failed request is reported through `onError`; use the
+retry notifier to recover failed pages. Controllers and notifier instances passed
+to the widget remain owned by the caller and should be disposed there.
 
 ## Contributions
 

@@ -144,6 +144,11 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             _nextPageRequest = null;
             _automaticFetchAllowed = true;
           }
+          if (state is PaginationError) {
+            // A successful explicit retry restores pages, but does not grant
+            // an additional automatic fetch beyond the failed request.
+            _automaticFetchAllowed = false;
+          }
           if (state is PaginationLoaded) {
             widget.onLoaded?.call(state);
             if (state.hasReachedEnd) widget.onReachedEnd?.call(state);
@@ -195,16 +200,18 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     super.didUpdateWidget(oldWidget);
     final oldOptions = oldWidget.options ?? const GetOptions();
     final newOptions = widget.options ?? const GetOptions();
+    final usesOneTimeReads = !widget.isLive || !widget.isAllItemsLive;
     var restarted = false;
     if (oldWidget.query != widget.query ||
         oldWidget.itemsPerPage != widget.itemsPerPage ||
         oldWidget.itemsGlobalLimit != widget.itemsGlobalLimit ||
-        oldWidget.startAfterDocument != widget.startAfterDocument ||
+        !_hasSameStartCursor(oldWidget) ||
         oldWidget.isLive != widget.isLive ||
-        oldWidget.isAllItemsLive != widget.isAllItemsLive ||
-        oldOptions.source != newOptions.source ||
-        oldOptions.serverTimestampBehavior !=
-            newOptions.serverTimestampBehavior) {
+        (widget.isLive && oldWidget.isAllItemsLive != widget.isAllItemsLive) ||
+        (usesOneTimeReads &&
+            (oldOptions.source != newOptions.source ||
+                oldOptions.serverTimestampBehavior !=
+                    newOptions.serverTimestampBehavior))) {
       _cubit?.close();
       _createCubit();
       restarted = true;
@@ -219,6 +226,22 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     }
   }
 
+  bool _hasSameStartCursor(PaginateFirestore oldWidget) {
+    final oldCursor = oldWidget.startAfterDocument;
+    final newCursor = widget.startAfterDocument;
+    if (identical(oldCursor, newCursor)) return true;
+    if (oldCursor == null || newCursor == null) return false;
+    try {
+      // Query equality compares the document path and ordered cursor values.
+      // Snapshot identity and changes to unrelated fields do not affect it.
+      return oldWidget.query.startAfterDocument(oldCursor) ==
+          widget.query.startAfterDocument(newCursor);
+    } catch (_) {
+      // Let the cubit report invalid cursors through the normal error state.
+      return false;
+    }
+  }
+
   void _attachListeners() {
     _attachedListeners = List.of(widget.listeners ?? []);
     var initialFilter = '';
@@ -229,6 +252,13 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           if (listener.refreshed) {
             _cubit?.refreshPaginatedList();
           }
+        }
+
+        listener.addListener(fn);
+        remover = () => listener.removeListener(fn);
+      } else if (listener is PaginateRetryChangeListener) {
+        void fn() {
+          _cubit?.retryPaginatedList();
         }
 
         listener.addListener(fn);

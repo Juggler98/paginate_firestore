@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:paginate_firestore/bloc/pagination_cubit.dart';
@@ -67,6 +69,12 @@ void main() {
     expect((cubit.state as PaginationError).error.toString(),
         contains('Pagination did not advance'));
     expect(store.requests.every((request) => request.cancelled), isTrue);
+    // Explicit retries cannot bypass the guard by starting a new session.
+    for (var i = 0; i < 5; i++) {
+      await cubit.retryPaginatedList();
+      await cubit.fetchPaginatedList();
+    }
+    expect(store.requests, hasLength(2));
   });
 
   test('a changed cursor value on the same document remains a new range',
@@ -198,6 +206,37 @@ void main() {
     await cubit.refreshPaginatedList();
     expect(store.requests, hasLength(1));
   });
+
+  for (final isLive in [false, true]) {
+    test('retry preserves successful pages and the read budget (live: $isLive)',
+        () async {
+      cubit = PaginationCubit(store.query, 2, null,
+          isLive: isLive, itemsGlobalLimit: 5);
+      await load([a, b]);
+      await load([c, d]);
+      final failed = cubit.fetchPaginatedList();
+      final failedQuery = store.requests.last.query;
+      store.requests.last.fail(Exception('unavailable'));
+      await failed;
+
+      final retry = cubit.fetchPaginatedList();
+      expect(identical(cubit.fetchPaginatedList(), retry), isTrue);
+      await pumpEventQueue();
+      expect(store.requests, hasLength(4));
+      expect(store.requests.last.query, failedQuery);
+      expect(store.requests.last.query.pageLimit, 1);
+      if (isLive) {
+        expect(store.requests[0].cancelled, isFalse);
+        expect(store.requests[1].cancelled, isFalse);
+      }
+      store.requests.last.respond([TestDocument('items/e')]);
+      await retry;
+      expect(paths(), ['items/a', 'items/b', 'items/c', 'items/d', 'items/e']);
+      expect(loaded().hasReachedEnd, isTrue);
+      await cubit.fetchPaginatedList();
+      expect(store.requests, hasLength(4));
+    });
+  }
 
   test('live pages keep the request locked until the first server snapshot',
       () async {
@@ -336,7 +375,7 @@ void main() {
     expect(store.requests.last.cancelled, isTrue);
   });
 
-  test('stream errors surface, cancel listeners and finish pending requests',
+  test('stream errors cancel only the failed listener and preserve the error',
       () async {
     cubit = PaginationCubit(store.query, 2, null, isLive: true);
     await load([a, b]);
@@ -344,7 +383,8 @@ void main() {
     store.requests.last.fail(Exception('permission denied'));
     await pending;
     expect(cubit.state, isA<PaginationError>());
-    expect(store.requests.every((r) => r.cancelled), isTrue);
+    expect(store.requests.first.cancelled, isFalse);
+    expect(store.requests.last.cancelled, isTrue);
     store.requests.first.respond([c]);
     await pumpEventQueue();
     expect(cubit.state, isA<PaginationError>());
@@ -495,9 +535,146 @@ void main() {
     expect(loaded().documentSnapshots[2].data(), {'value': 'New date'});
   });
 
+  test(
+      'each retry recovers only one failed live page and keeps healthy updates',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    await load([c, d]);
+    await load([TestDocument('items/e'), TestDocument('items/f')]);
+    store.requests[0].fail(Exception('first failed'));
+    store.requests[2].fail(Exception('third failed'));
+    await pumpEventQueue();
+    store.requests[1].respond([c, TestDocument('items/d', 'Updated date')]);
+    await pumpEventQueue();
+    expect(cubit.state, isA<PaginationError>());
+
+    final retry = cubit.retryPaginatedList();
+    expect(cubit.retryPaginatedList(), same(retry));
+    await pumpEventQueue();
+    expect(store.requests, hasLength(4));
+    expect(store.requests[3].query, store.requests[0].query);
+    expect(store.requests[1].cancelled, isFalse);
+    store.requests[3].respond([a, b]);
+    await retry;
+    await pumpEventQueue();
+    expect(cubit.state, isA<PaginationError>());
+    expect((cubit.state as PaginationError).error.toString(),
+        contains('third failed'));
+    expect(store.requests, hasLength(4));
+    final nextRetry = cubit.retryPaginatedList();
+    await pumpEventQueue();
+    expect(store.requests, hasLength(5));
+    expect(store.requests[4].query, store.requests[2].query);
+    store.requests[4].respond([TestDocument('items/e')]);
+    await nextRetry;
+    expect(paths(), ['items/a', 'items/b', 'items/c', 'items/d', 'items/e']);
+    expect(loaded().documentSnapshots[3].data(), {'value': 'Updated date'});
+    expect(loaded().hasReachedEnd, isTrue);
+  });
+
+  test('an empty retried live page removes its previous documents', () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([a, b]);
+    await load([c]);
+    store.requests.last.fail(Exception('listener failed'));
+    await pumpEventQueue();
+    final retry = cubit.retryPaginatedList();
+    await pumpEventQueue();
+    store.requests.last.respond([], fromCache: true);
+    await pumpEventQueue();
+    expect(cubit.state, isA<PaginationError>());
+    store.requests.last.respond([], metadataOnly: true);
+    await retry;
+    expect(paths(), ['items/a', 'items/b']);
+    expect(loaded().hasReachedEnd, isTrue);
+    expect(store.requests, hasLength(3));
+  });
+
+  test('a successful pending read is retained while another page has an error',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null,
+        isLive: true, isAllItemsLive: false);
+    await load([a, b]);
+    final next = cubit.fetchPaginatedList();
+    store.requests.first.fail(Exception('listener failed'));
+    await pumpEventQueue();
+    store.requests[1].respond([c, d]);
+    await next;
+    expect(cubit.state, isA<PaginationError>());
+    final retry = cubit.retryPaginatedList();
+    await pumpEventQueue();
+    expect(store.requests, hasLength(3));
+    expect(store.requests.last.query.cursor, isNull);
+    store.requests.last.respond([a, b]);
+    await retry;
+    expect(paths(), ['items/a', 'items/b', 'items/c', 'items/d']);
+  });
+
+  for (final closeInstead in [false, true]) {
+    test(
+        'a delayed retry is invalidated by ${closeInstead ? 'close' : 'refresh'}',
+        () async {
+      cubit = PaginationCubit(store.query, 2, null, isLive: true);
+      await load([a, b]);
+      final gate = Completer<void>();
+      store.requests.single.cancellationGate = gate;
+      store.requests.single.fail(Exception('listener failed'));
+      await pumpEventQueue();
+      final retry = cubit.retryPaginatedList();
+      await pumpEventQueue();
+      expect(store.requests, hasLength(1));
+      final replacement =
+          closeInstead ? cubit.close() : cubit.refreshPaginatedList();
+      gate.complete();
+      await pumpEventQueue();
+      if (!closeInstead) {
+        expect(store.requests, hasLength(2));
+        store.requests.last.respond([d]);
+      }
+      await retry;
+      await replacement;
+      expect(store.requests, hasLength(closeInstead ? 1 : 2));
+      if (!closeInstead) expect(paths(), ['items/d']);
+    });
+  }
+
+  test(
+      'repeated failed retries do not reread healthy pages or retry themselves',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null);
+    await load([a, b]);
+    for (var i = 0; i < 4; i++) {
+      final attempt = cubit.fetchPaginatedList();
+      await pumpEventQueue();
+      expect(store.requests, hasLength(i + 2));
+      expect(store.requests.last.query.cursor, same(b));
+      store.requests.last.fail(Exception('unavailable'));
+      await attempt;
+      await pumpEventQueue();
+      expect(store.requests, hasLength(i + 2));
+      expect(cubit.state, isA<PaginationError>());
+    }
+  });
+
+  test('retrying or clearing a local filter error makes no Firestore reads',
+      () async {
+    cubit = PaginationCubit(store.query, 2, null, isLive: true);
+    await load([InvalidDocument()]);
+    cubit.filterPaginatedList('anything');
+    expect(cubit.state, isA<PaginationError>());
+    await cubit.retryPaginatedList();
+    expect(cubit.state, isA<PaginationError>());
+    expect(store.requests, hasLength(1));
+    expect(store.requests.single.cancelled, isFalse);
+    cubit.filterPaginatedList('');
+    expect(paths(), ['items/invalid']);
+    expect(store.requests, hasLength(1));
+  });
+
   for (final olderReadFails in [false, true]) {
     test(
-        'retry after a live error ignores a pending read '
+        'retry after a live error preserves a pending read '
         'that later ${olderReadFails ? 'fails' : 'succeeds'}', () async {
       cubit = PaginationCubit(store.query, 2, null,
           isLive: true, isAllItemsLive: false);
@@ -514,19 +691,29 @@ void main() {
       expect(store.requests, hasLength(3));
       expect(store.requests.last.isLive, isTrue);
       expect(store.requests.last.query.cursor, isNull);
-      store.requests.last.respond([c]);
+      store.requests.last.respond([a, b]);
       await retry;
 
       if (olderReadFails) {
-        olderRequest.fail(Exception('stale read failed'));
+        olderRequest.fail(Exception('later page failed'));
       } else {
-        olderRequest.respond([d]);
+        olderRequest.respond([c, d]);
       }
       await olderFetch;
-      expect(paths(), ['items/c']);
+      if (olderReadFails) {
+        expect(cubit.state, isA<PaginationError>());
+        final nextRetry = cubit.retryPaginatedList();
+        await pumpEventQueue();
+        expect(store.requests, hasLength(4));
+        expect(store.requests.last.query.cursor, same(b));
+        expect(store.requests.last.isLive, isFalse);
+        store.requests.last.respond([c, d]);
+        await nextRetry;
+      }
+      expect(paths(), ['items/a', 'items/b', 'items/c', 'items/d']);
       expect(store.requests.first.cancelled, isTrue);
-      expect(store.requests.last.cancelled, isFalse);
-      expect(store.requests, hasLength(3));
+      expect(store.requests[2].cancelled, isFalse);
+      expect(store.requests, hasLength(olderReadFails ? 4 : 3));
     });
   }
 }

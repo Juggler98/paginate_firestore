@@ -71,9 +71,15 @@ class RecordedRequest {
   final GetOptions? options;
   final result = Completer<QuerySnapshot<Json>>();
   bool cancelled = false;
+  Completer<void>? cancellationGate;
   List<TestDocument> _previousDocuments = [];
   late final stream = StreamController<QuerySnapshot<Json>>(
-    onCancel: () => cancelled = true,
+    onCancel: () {
+      cancelled = true;
+      // Complete in this test's zone, rather than using the SDK's shared
+      // already-completed cancellation future outside widget fake async.
+      return cancellationGate?.future ?? Future<void>.value();
+    },
   );
 
   void respond(List<TestDocument> docs,

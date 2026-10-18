@@ -34,16 +34,15 @@ class PaginationCubit extends Cubit<PaginationState> {
   // later pages or move the cursor used to fetch the next page.
   final _pages = <_PaginationPage>[];
   final _requestedQueries = <Query>{};
-  final _streams = <StreamSubscription<QuerySnapshot>>[];
-  final _pendingSnapshots = <Completer<void>>{};
   List<DocumentSnapshot> _documents = [];
   Future<void>? _request;
   Future<void>? _refreshRequest;
+  Future<void>? _retryRequest;
   String _filterTerm = '';
   int _generation = 0;
   int _revision = 0;
   bool _disposed = false;
-  bool _hasError = false;
+  bool _needsRefresh = false;
   bool _includeMetadataChanges;
 
   bool get includeMetadataChanges => _includeMetadataChanges;
@@ -52,7 +51,15 @@ class PaginationCubit extends Cubit<PaginationState> {
   void updateMetadataChanges(bool value) => _includeMetadataChanges = value;
 
   /// Includes waiting for a live page's server confirmation.
-  bool get isFetching => _request != null || _refreshRequest != null;
+  bool get isFetching =>
+      _request != null || _refreshRequest != null || _retryRequest != null;
+
+  _PaginationPage? get _failedPage {
+    for (final page in _pages) {
+      if (page.error != null) return page;
+    }
+    return null;
+  }
 
   int get _requestedCount =>
       _pages.fold(0, (total, page) => total + page.limit);
@@ -64,25 +71,29 @@ class PaginationCubit extends Cubit<PaginationState> {
           ((itemsGlobalLimit != null && _requestedCount >= itemsGlobalLimit!) ||
               _pages.last.hasReachedEnd));
 
-  bool _isCurrent(int generation) =>
-      !_disposed && !_hasError && generation == _generation;
+  bool _isCurrent(int generation) => !_disposed && generation == _generation;
 
   @override
   Future<void> close() async {
     _disposed = true;
     _generation++;
-    await _clearStreams();
+    await Future.wait(_pages.map(_stopPage));
     await super.close();
   }
 
-  Future<void> _clearStreams() async {
-    final streams = List.of(_streams);
-    _streams.clear();
-    for (final pending in _pendingSnapshots) {
-      if (!pending.isCompleted) pending.complete();
+  Future<void> _stopPage(_PaginationPage page) {
+    // Invalidate callbacks before cancellation, including a cancelled listener
+    // whose native registration has not finished yet.
+    page.attempt++;
+    final confirmation = page.confirmation;
+    if (confirmation != null && !confirmation.isCompleted) {
+      confirmation.complete();
     }
-    _pendingSnapshots.clear();
-    await Future.wait(streams.map((stream) => stream.cancel()));
+    page.confirmation = null;
+    final subscription = page.subscription;
+    page.subscription = null;
+    if (subscription != null) page.cancellation = subscription.cancel();
+    return page.cancellation ?? Future<void>.value();
   }
 
   /// Filters only documents already loaded, without issuing Firestore reads.
@@ -91,12 +102,8 @@ class PaginationCubit extends Cubit<PaginationState> {
     final normalizedTerm = searchTerm.toLowerCase();
     if (_filterTerm == normalizedTerm) return;
     _filterTerm = normalizedTerm;
-    if (!_disposed && state is PaginationLoaded) {
-      try {
-        _emitLoaded();
-      } catch (error) {
-        _handleError(error, _generation);
-      }
+    if (!_disposed && state is! PaginationInitial) {
+      _emitState();
     }
   }
 
@@ -105,15 +112,17 @@ class PaginationCubit extends Cubit<PaginationState> {
     if (_refreshRequest != null) return _refreshRequest!;
 
     final generation = ++_generation;
-    _hasError = false;
+    final oldPages = List.of(_pages);
+    _needsRefresh = false;
     _pages.clear();
     _requestedQueries.clear();
     _documents = [];
     _request = null;
+    _retryRequest = null;
     emit(PaginationInitial());
 
     late final Future<void> request;
-    request = _clearStreams().then((_) async {
+    request = Future.wait(oldPages.map(_stopPage)).then((_) async {
       if (_isCurrent(generation)) await _fetchPage(generation);
     }).whenComplete(() {
       if (identical(_refreshRequest, request)) _refreshRequest = null;
@@ -127,9 +136,8 @@ class PaginationCubit extends Cubit<PaginationState> {
   Future<void> fetchPaginatedList() {
     if (_disposed) return Future.value();
     if (_refreshRequest != null) return _refreshRequest!;
-    // A live listener can fail while a later one-time read is still pending.
-    // Retrying must start a new session rather than wait for that stale read.
-    if (_hasError) return refreshPaginatedList();
+    if (_retryRequest != null) return _retryRequest!;
+    if (state is PaginationError) return retryPaginatedList();
     if (_request != null) return _request!;
     if (_hasReachedEnd && state is! PaginationInitial) {
       return Future.value();
@@ -143,29 +151,51 @@ class PaginationCubit extends Cubit<PaginationState> {
     return request;
   }
 
+  /// Retries one failed page, retaining loaded data and healthy live listeners.
+  /// Calling this without an error does not request another page.
+  /// Cursor/query errors require an explicit refresh or corrected settings.
+  Future<void> retryPaginatedList() {
+    if (_disposed) return Future.value();
+    if (_refreshRequest != null) return _refreshRequest!;
+    if (_retryRequest != null) return _retryRequest!;
+    if (_needsRefresh) return Future.value();
+    final page = _failedPage;
+    if (page == null) {
+      // A local conversion/filter error must not cause another Firestore read.
+      if (state is PaginationError) _emitState();
+      return Future.value();
+    }
+    final generation = _generation;
+    late final Future<void> request;
+    request = _stopPage(page).then((_) async {
+      if (_isCurrent(generation)) await _readPage(page, generation);
+    }).whenComplete(() {
+      if (identical(_retryRequest, request)) _retryRequest = null;
+    });
+    _retryRequest = request;
+    return request;
+  }
+
   Future<void> _fetchPage(int generation) async {
     // An already loaded live page can later receive pending local writes or
     // cached updates. Wait for its latest cursor, not just its first snapshot.
     while (_pages.isNotEmpty && !_pages.last.cursorIsCurrent) {
       final page = _pages.last;
       final confirmation = page.confirmation ??= Completer<void>();
-      _pendingSnapshots.add(confirmation);
       await confirmation.future;
-      if (!_isCurrent(generation)) return;
+      if (!_isCurrent(generation) || state is PaginationError) return;
     }
     if (_hasReachedEnd) {
       // Match asynchronous query completion so widget listeners can subscribe
       // before a zero-limit request reports that it has loaded.
       await Future<void>.value();
-      if (_isCurrent(generation)) _emitLoaded();
+      if (_isCurrent(generation)) _emitState();
       return;
     }
     final pageLimit = itemsGlobalLimit == null
         ? _limit
         : min(_limit, itemsGlobalLimit! - _requestedCount);
     final cursor = _pages.isEmpty ? _startAfterDocument : _pages.last.cursor;
-    final page = _PaginationPage(pageLimit, cursor);
-
     try {
       final query =
           (cursor == null ? _query : _query.startAfterDocument(cursor))
@@ -174,56 +204,75 @@ class PaginationCubit extends Cubit<PaginationState> {
         throw StateError(
             'Pagination did not advance. Refresh before loading more.');
       }
+      final page = _PaginationPage(query, pageLimit, cursor,
+          isLive: isLive && (_pages.isEmpty || isAllItemsLive));
       _pages.add(page);
-      if (isLive && (_pages.length == 1 || isAllItemsLive)) {
-        final ready = Completer<void>();
-        _pendingSnapshots.add(ready);
-        final listener = query
+      await _readPage(page, generation);
+    } catch (error) {
+      if (!_isCurrent(generation)) return;
+      _needsRefresh = true;
+      unawaited(Future.wait(_pages.map(_stopPage)));
+      emit(PaginationError(error: _asException(error)));
+    }
+  }
+
+  Future<void> _readPage(_PaginationPage page, int generation) async {
+    final attempt = ++page.attempt;
+    // A new subscription's first snapshot replaces the saved page even when
+    // it is empty and therefore contains no document changes.
+    page.receivedSnapshot = false;
+    bool isCurrentAttempt() =>
+        _isCurrent(generation) && page.attempt == attempt;
+
+    try {
+      if (page.isLive) {
+        final confirmation = page.confirmation ??= Completer<void>();
+        page.cursorIsCurrent = false;
+        final listener = page.query
             // A cache snapshot can be incomplete. Metadata events let us wait
             // for confirmation even when the server returns identical data.
             .snapshots(includeMetadataChanges: true)
             .listen((snapshot) {
-          if (!_isCurrent(generation)) return;
+          if (!isCurrentAttempt()) return;
           try {
             final confirmed = !snapshot.metadata.isFromCache &&
                 !snapshot.metadata.hasPendingWrites;
+            if (confirmed) page.error = null;
             _updatePage(page, snapshot,
                 confirmed: confirmed, emitMetadata: includeMetadataChanges);
-            if (confirmed && !ready.isCompleted) {
-              ready.complete();
-              _pendingSnapshots.remove(ready);
-            }
           } catch (error) {
             // Converter failures happen inside the data callback, not onError.
-            _handleError(error, generation);
+            if (isCurrentAttempt()) _failPage(page, error);
           }
         }, onError: (Object error, StackTrace stackTrace) {
-          _handleError(error, generation);
+          if (isCurrentAttempt()) _failPage(page, error);
         }, onDone: () {
-          _handleError(
-              StateError('The Firestore listener closed unexpectedly.'),
-              generation);
+          if (isCurrentAttempt()) {
+            _failPage(page,
+                StateError('The Firestore listener closed unexpectedly.'));
+          }
         });
-        _streams.add(listener);
-        await ready.future;
+        page.subscription = listener;
+        await confirmation.future;
       } else {
-        final snapshot = await query.get(options);
-        if (_isCurrent(generation)) {
+        final snapshot = await page.query.get(options);
+        if (isCurrentAttempt()) {
+          page.error = null;
           _updatePage(page, snapshot, confirmed: true);
         }
       }
     } catch (error) {
-      _handleError(error, generation);
+      if (isCurrentAttempt()) _failPage(page, error);
     }
   }
 
-  void _handleError(Object error, int generation) {
-    if (!_isCurrent(generation)) return;
-    _hasError = true;
-    emit(PaginationError(
-      error: error is Exception ? error : Exception(error.toString()),
-    ));
-    unawaited(_clearStreams());
+  Exception _asException(Object error) =>
+      error is Exception ? error : Exception(error.toString());
+
+  void _failPage(_PaginationPage page, Object error) {
+    page.error = _asException(error);
+    unawaited(_stopPage(page));
+    _emitState();
   }
 
   void _updatePage(
@@ -243,7 +292,6 @@ class PaginationCubit extends Cubit<PaginationState> {
       final confirmation = page.confirmation;
       if (confirmation != null) {
         confirmation.complete();
-        _pendingSnapshots.remove(confirmation);
         page.confirmation = null;
       }
     }
@@ -272,11 +320,12 @@ class PaginationCubit extends Cubit<PaginationState> {
     if (hasDocumentChanges ||
         emitMetadata ||
         wasAtEnd != _hasReachedEnd ||
-        state is PaginationInitial) {
+        state is PaginationInitial ||
+        state is PaginationError) {
       // Only the initial empty cache is inconclusive. Later local deletions
       // must also be reflected while their writes are still pending.
       if (_documents.isNotEmpty || confirmed || state is PaginationLoaded) {
-        _emitLoaded();
+        _emitState();
       }
     }
   }
@@ -299,24 +348,45 @@ class PaginationCubit extends Cubit<PaginationState> {
     _documents = documents.values.toList();
   }
 
-  void _emitLoaded() {
-    final documents = _filterTerm.isEmpty
-        ? _documents
-        : _documents
-            .where((document) =>
-                document.data().toString().toLowerCase().contains(_filterTerm))
-            .toList();
-    emit(PaginationLoaded(
-      documentSnapshots: List.unmodifiable(documents),
-      hasReachedEnd: _hasReachedEnd,
-    ));
+  void _emitState() {
+    // Healthy listeners continue updating retained pages, but must not hide a
+    // different page's error or let the widget start automatic pagination.
+    if (_needsRefresh) return;
+    final pageError = _failedPage?.error;
+    if (pageError != null) {
+      emit(PaginationError(error: pageError));
+      return;
+    }
+    try {
+      final documents = _filterTerm.isEmpty
+          ? _documents
+          : _documents
+              .where((document) => document
+                  .data()
+                  .toString()
+                  .toLowerCase()
+                  .contains(_filterTerm))
+              .toList();
+      emit(PaginationLoaded(
+        documentSnapshots: List.unmodifiable(documents),
+        hasReachedEnd: _hasReachedEnd,
+      ));
+    } catch (error) {
+      emit(PaginationError(error: _asException(error)));
+    }
   }
 }
 
 class _PaginationPage {
-  _PaginationPage(this.limit, this.cursor);
+  _PaginationPage(this.query, this.limit, this.cursor, {required this.isLive});
 
+  final Query query;
   final int limit;
+  final bool isLive;
+  StreamSubscription<QuerySnapshot>? subscription;
+  Future<void>? cancellation;
+  int attempt = 0;
+  Exception? error;
   DocumentSnapshot? cursor;
   List<QueryDocumentSnapshot> documents = [];
   bool hasReachedEnd = false;

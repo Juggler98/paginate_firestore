@@ -15,9 +15,11 @@ void main() {
     void Function(PaginationLoaded)? onLoaded,
     int pageSize = 2,
     bool isLive = false,
+    bool isAllItemsLive = true,
     bool includeMetadataChanges = false,
     bool outerScroll = false,
     GetOptions? options,
+    DocumentSnapshot? startAfterDocument,
     int? globalLimit,
     PaginateBuilderType builderType = PaginateBuilderType.listView,
     PageController? pageController,
@@ -31,10 +33,12 @@ void main() {
       listeners: listeners,
       scrollController: controller,
       isLive: isLive,
+      isAllItemsLive: isAllItemsLive,
       includeMetadataChanges: includeMetadataChanges,
       shrinkWrap: outerScroll,
       onLoaded: onLoaded,
       options: options,
+      startAfterDocument: startAfterDocument,
       itemsGlobalLimit: globalLimit,
       itemBuilder: itemBuilder ??
           (context, docs, index) =>
@@ -186,6 +190,7 @@ void main() {
       // One explicit retry makes one attempt; a second failure stays stopped.
       refresh.refreshed = true;
       await tester.pump();
+      await tester.pump();
       expect(store.requests, hasLength(3));
       store.requests.last.fail(Exception('still denied'));
       await tester.pumpAndSettle();
@@ -199,6 +204,70 @@ void main() {
       refresh.dispose();
     });
   }
+
+  for (final isLive in [false, true]) {
+    testWidgets('retry notifier recovers only the failed page (live: $isLive)',
+        (tester) async {
+      final store = RecordingFirestore();
+      final retry = PaginateRetryChangeListener();
+      await tester
+          .pumpWidget(buildWidget(store, isLive: isLive, listeners: [retry]));
+      store.requests.single.respond([
+        TestDocument('items/a'),
+        TestDocument('items/b'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      final failedQuery = store.requests.last.query;
+      store.requests.last.fail(Exception('unavailable'));
+      await tester.pumpAndSettle();
+      for (var i = 0; i < 10; i++) {
+        retry.retry();
+      }
+      await tester.pump();
+      await tester.pump();
+      expect(store.requests, hasLength(3));
+      expect(store.requests.last.query, failedQuery);
+      store.requests.last.respond([
+        TestDocument('items/c'),
+        TestDocument('items/d'),
+      ]);
+      await tester.pumpAndSettle();
+      expect(find.text('items/a'), findsOneWidget);
+      expect(find.text('items/c'), findsOneWidget);
+      expect(find.text('Load more'), findsOneWidget);
+      for (var i = 0; i < 10; i++) {
+        retry.retry();
+        await tester.pump();
+      }
+      expect(store.requests, hasLength(3));
+      await tester.pumpWidget(const SizedBox());
+      // Removing the widget detaches its listener without owning the notifier.
+      retry.retry();
+      expect(store.requests, hasLength(3));
+      retry.dispose();
+    });
+  }
+
+  testWidgets('retrying the initial page does not automatically fetch page two',
+      (tester) async {
+    final store = RecordingFirestore();
+    final retry = PaginateRetryChangeListener();
+    await tester.pumpWidget(buildWidget(store, listeners: [retry]));
+    store.requests.single.fail(Exception('unavailable'));
+    await tester.pumpAndSettle();
+    retry.retry();
+    await tester.pump();
+    store.requests.last.respond([
+      TestDocument('items/a'),
+      TestDocument('items/b'),
+    ]);
+    await tester.pumpAndSettle();
+    expect(store.requests, hasLength(2));
+    expect(find.text('Load more'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    retry.dispose();
+  });
 
   for (final builderType in PaginateBuilderType.values) {
     testWidgets(
@@ -329,6 +398,51 @@ void main() {
     expect(store.requests, hasLength(2));
     expect(store.requests.last.options!.source, Source.cache);
     store.requests.last.respond([TestDocument('items/b')]);
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('equivalent cursor snapshots do not restart pagination',
+      (tester) async {
+    final store = RecordingFirestore();
+    await tester.pumpWidget(buildWidget(store,
+        startAfterDocument: TestDocument('items/start', 'same sort value')));
+    store.requests.single.respond([TestDocument('items/a')]);
+    await tester.pumpAndSettle();
+    for (var i = 0; i < 10; i++) {
+      await tester.pumpWidget(buildWidget(store,
+          startAfterDocument: TestDocument('items/start', 'same sort value')));
+    }
+    expect(store.requests, hasLength(1));
+
+    await tester.pumpWidget(buildWidget(store,
+        startAfterDocument: TestDocument('items/start', 'changed sort value')));
+    expect(store.requests, hasLength(2));
+    store.requests.last.respond([TestDocument('items/b')]);
+    await tester.pumpAndSettle();
+    expect(find.text('items/b'), findsOneWidget);
+  });
+
+  testWidgets('irrelevant live/read settings do not restart queries',
+      (tester) async {
+    final store = RecordingFirestore();
+    await tester.pumpWidget(buildWidget(store));
+    store.requests.single.respond([TestDocument('items/a')]);
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(buildWidget(store, isAllItemsLive: false));
+    expect(store.requests, hasLength(1));
+
+    await tester.pumpWidget(buildWidget(store, isLive: true));
+    store.requests.last.respond([TestDocument('items/b')]);
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(buildWidget(store,
+        isLive: true, options: const GetOptions(source: Source.cache)));
+    expect(store.requests, hasLength(2));
+    expect(store.requests.last.cancelled, isFalse);
+    await tester.pumpWidget(buildWidget(store,
+        isLive: false, options: const GetOptions(source: Source.cache)));
+    expect(store.requests, hasLength(3));
+    expect(store.requests.last.options!.source, Source.cache);
+    store.requests.last.respond([TestDocument('items/c')]);
     await tester.pumpAndSettle();
   });
 
