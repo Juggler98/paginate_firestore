@@ -101,6 +101,11 @@ mean fewer unique displayed documents than the allowance.
 | `isLive: true, isAllItemsLive: false` | One listener on the first page; later pages use `get()`. Historical pages remain unchanged until refresh. |
 | `isLive: true, isAllItemsLive: true` (default for live mode) | One listener per requested page; updates to loaded pages stay visible. |
 
+For read savings, keep the default `isLive: false` when updating on explicit
+refresh is sufficient. Use `isAllItemsLive: false` if only the first page needs
+live updates. Neither mode automatically refreshes historical pages to keep them
+fresh; choose based on what the screen needs.
+
 Larger pages reduce request/listener count but can fetch documents the user never
 views. Scrolling prefetches when Flutter builds the bottom loader, which can occur
 just before it becomes visible. After the initial page, the widget automatically
@@ -203,6 +208,38 @@ all pages are live, also leaves the session intact because those settings are
 unused in those modes. A failed request is reported through `onError`; use the
 retry notifier to recover failed pages. Controllers and notifier instances passed
 to the widget remain owned by the caller and should be disposed there.
+
+### Keep converted queries stable across rebuilds
+
+Firestore query equality includes the callbacks passed to `withConverter()`.
+Recreating those callbacks in `build()` can make the query compare unequal even
+when the collection, filters, and sorting are unchanged. The widget then starts
+over and requests the first page again. An `onLoaded` callback that rebuilds the
+parent can turn this into a repeating cycle.
+
+Create and retain the converted query in the owning State or repository:
+
+```dart
+// A field in your State class, not inside build().
+late final Query<User> usersQuery = FirebaseFirestore.instance
+    .collection('users')
+    .orderBy('name')
+    .withConverter<User>(
+      fromFirestore: (snapshot, _) => User.fromJson(snapshot.data()!),
+      toFirestore: (user, _) => user.toJson(),
+    );
+
+// In PaginateFirestore:
+query: usersQuery,
+```
+
+For queries depending on filters or the signed-in user, use a replaceable field
+and rebuild the query when those inputs change. Stable converter functions, such
+as top-level functions or static method tear-offs, also preserve query equality.
+Equivalent ordinary queries without converters can be recreated without a
+restart. Query restarts are separate from failed-page retries and reset the
+pagination allowance, so keeping query inputs stable matters even with the
+automatic-read safeguards.
 
 ## Contributions
 
