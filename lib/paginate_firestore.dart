@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show SchedulerPhase;
 import 'package:flutter/rendering.dart'
     show
         RenderAbstractViewport,
@@ -153,6 +154,19 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (notification.depth != 0) return false;
+        if (notification is ScrollStartNotification ||
+            notification is ScrollEndNotification) {
+          // Rebuild cached controls when activity changes. Dimension changes
+          // can end/start a bounce during layout, when setState is not safe.
+          if (WidgetsBinding.instance.schedulerPhase ==
+              SchedulerPhase.persistentCallbacks) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) setState(() {});
+            });
+          } else {
+            setState(() {});
+          }
+        }
         if (notification is UserScrollNotification) {
           _scrollGestureAllowed =
               notification.direction == ScrollDirection.reverse &&
@@ -504,25 +518,38 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     }));
   }
 
-  Widget _buildPaginationControl() {
+  Widget _buildPaginationControl(BuildContext context) {
     _schedulePaginationCheck();
-    return KeyedSubtree(
+    final scrollable = Scrollable.of(context);
+    final showLoader = scrollable.position.isScrollingNotifier.value ||
+        !_showManualLoadMore ||
+        _nextPageRequest != null ||
+        _cubit!.isFetching ||
+        _cubit!.state is PaginationInitial;
+    return IndexedStack(
       key: _paginationControlKey,
-      child: !_showManualLoadMore ||
-              _nextPageRequest != null ||
-              _cubit!.isFetching ||
-              _cubit!.state is PaginationInitial
-          ? widget.bottomLoader
-          : Center(
-              child: TextButton(
-                onPressed: () {
-                  _automaticFillStopped = true;
-                  _scrollRequestAllowed = false;
-                  _fetchNextPage();
-                },
-                child: Text(widget.loadMoreLabel),
-              ),
-            ),
+      // Reserve the same space for both controls. Changing the trailing extent
+      // on scroll start/end could otherwise create repeated edge bounces.
+      index: showLoader ? 0 : 1,
+      alignment: switch (scrollable.axisDirection) {
+        AxisDirection.down => Alignment.topCenter,
+        AxisDirection.up => Alignment.bottomCenter,
+        AxisDirection.right => Alignment.centerLeft,
+        AxisDirection.left => Alignment.centerRight,
+      },
+      children: [
+        TickerMode(enabled: showLoader, child: widget.bottomLoader),
+        Center(
+          child: TextButton(
+            onPressed: () {
+              _automaticFillStopped = true;
+              _scrollRequestAllowed = false;
+              _fetchNextPage();
+            },
+            child: Text(widget.loadMoreLabel),
+          ),
+        ),
+      ],
     );
   }
 
@@ -557,7 +584,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             delegate: SliverChildBuilderDelegate(
               (context, index) {
                 if (index >= loadedState.documentSnapshots.length) {
-                  return _buildPaginationControl();
+                  return _buildPaginationControl(context);
                 }
                 final doc = loadedState.documentSnapshots[index];
                 return KeyedSubtree(
@@ -612,7 +639,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 final itemIndex = index ~/ 2;
                 if (index.isEven) {
                   if (itemIndex >= loadedState.documentSnapshots.length) {
-                    return _buildPaginationControl();
+                    return _buildPaginationControl(context);
                   }
                   final doc = loadedState.documentSnapshots[itemIndex];
                   return KeyedSubtree(
@@ -673,7 +700,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
         childrenDelegate: SliverChildBuilderDelegate(
           (context, index) {
             if (index >= loadedState.documentSnapshots.length) {
-              return _buildPaginationControl();
+              return _buildPaginationControl(context);
             }
             final doc = loadedState.documentSnapshots[index];
             return KeyedSubtree(

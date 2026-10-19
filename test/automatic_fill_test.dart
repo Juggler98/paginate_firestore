@@ -278,6 +278,7 @@ void main() {
         await tester.pumpAndSettle();
         controller.jumpTo(controller.position.maxScrollExtent);
         await tester.pumpAndSettle();
+        final idleExtent = controller.position.maxScrollExtent;
         final gesture = await tester.startGesture(const Offset(150, 150));
         await gesture.moveBy(Offset(0, reverse ? 100 : -100));
         for (var frame = 0; frame < 8; frame++) {
@@ -286,6 +287,7 @@ void main() {
             expect(button, findsNothing);
             expect(find.byType(BottomLoader), findsOneWidget);
           }
+          expect(controller.position.maxScrollExtent, idleExtent);
         }
         expect(store.requests, hasLength(2));
         await gesture.up();
@@ -372,14 +374,25 @@ void main() {
           find.byType(CustomScrollView), Offset(0, reverse ? 100 : -100), 1500);
       for (var frame = 0; frame < 8; frame++) {
         await tester.pump(const Duration(milliseconds: 16));
-        if (store.requests.length > 1) expect(button, findsNothing);
+        if (controller.position.isScrollingNotifier.value ||
+            store.requests.length > 1) {
+          expect(button, findsNothing);
+        }
       }
       expect(store.requests, hasLength(2));
       // A quick response with no new visible height must not let the rest of
       // the fling or bounce request further pages.
       store.requests.last.respond(page(1));
+      for (var frame = 0; frame < 8; frame++) {
+        await tester.pump(const Duration(milliseconds: 16));
+        if (controller.position.isScrollingNotifier.value) {
+          expect(button, findsNothing);
+        }
+        expect(store.requests, hasLength(2));
+      }
       await tester.pumpAndSettle();
       expect(store.requests, hasLength(2));
+      expect(button, findsOneWidget);
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
     },
@@ -447,14 +460,17 @@ void main() {
     expect(store.requests, hasLength(2));
     store.requests.last.respond(page(1));
     await frames(tester);
+    expect(button, findsNothing);
     for (var i = 0; i < 5; i++) {
       await gesture.moveBy(const Offset(0, -20));
       await frames(tester);
       expect(store.requests, hasLength(2));
+      expect(button, findsNothing);
     }
     await gesture.up();
     await tester.pumpAndSettle();
     expect(store.requests, hasLength(2));
+    expect(button, findsOneWidget);
   });
 
   testWidgets(
