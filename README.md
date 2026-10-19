@@ -124,8 +124,8 @@ and does not reset or resume the automatic-fill cycle.
 
 Once content fills the viewport, automatic filling stops for that session, even
 if later filtering or live deletions make the content shorter. Real user scrolling
-near the end continues normal pagination, with one page per qualifying user
-scroll action and one request in flight at a time.
+toward the next page near the end continues pagination, with one page per
+qualifying user scroll action and one request in flight at a time.
 Rebuilds, programmatic scrolling, and a continuously visible loader do not request
 more pages. When filling stops, **Load more** remains available; each tap requests
 exactly one page and does not start another fill cycle.

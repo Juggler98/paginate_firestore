@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:paginate_firestore/bloc/pagination_listeners.dart';
@@ -125,6 +126,14 @@ void main() {
         controller.jumpTo(controller.position.maxScrollExtent);
         await tester.pumpAndSettle();
         expect(store.requests, hasLength(3));
+        // Browsing back through already loaded items must not fetch more just
+        // because the gesture started near the pagination control.
+        await tester.drag(
+            find.byType(CustomScrollView), Offset(0, reverse ? -30 : 30));
+        await frames(tester);
+        expect(store.requests, hasLength(3));
+        controller.jumpTo(controller.position.maxScrollExtent);
+        await tester.pumpAndSettle();
         await tester.drag(
             find.byType(CustomScrollView), Offset(0, reverse ? 100 : -100));
         await frames(tester);
@@ -145,6 +154,90 @@ void main() {
   }
 
   for (final reverse in [false, true]) {
+    for (final axis in Axis.values) {
+      testWidgets(
+          'mouse wheel respects direction in ${axis.name}, reverse=$reverse',
+          (tester) async {
+        final store = RecordingFirestore();
+        final controller = ScrollController();
+        await tester.pumpWidget(pagination(store,
+            itemExtent: 200,
+            controller: controller,
+            axis: axis,
+            reverse: reverse));
+        store.requests.single.respond(page(0));
+        await tester.pumpAndSettle();
+        expect(store.requests, hasLength(1));
+        controller.jumpTo(controller.position.maxScrollExtent - 30);
+        await tester.pumpAndSettle();
+        final animation = controller.animateTo(
+          controller.position.maxScrollExtent - 10,
+          duration: const Duration(milliseconds: 100),
+          curve: Curves.linear,
+        );
+        await tester.pumpAndSettle();
+        await animation;
+        expect(store.requests, hasLength(1));
+
+        final pointer = TestPointer(1, PointerDeviceKind.mouse);
+        pointer.hover(tester.getCenter(find.byType(CustomScrollView)));
+        Offset delta(double value) {
+          final physicalDelta = reverse ? -value : value;
+          return axis == Axis.vertical
+              ? Offset(0, physicalDelta)
+              : Offset(physicalDelta, 0);
+        }
+
+        // A wheel event completes its scroll notifications before the frame.
+        // Moving away must do nothing; moving toward the end must still load.
+        final previousOffset = controller.offset;
+        await tester.sendEventToBinding(pointer.scroll(delta(-10)));
+        await tester.pumpAndSettle();
+        expect(controller.offset, lessThan(previousOffset));
+        expect(store.requests, hasLength(1));
+        await tester.sendEventToBinding(pointer.scroll(delta(10)));
+        await frames(tester);
+        expect(store.requests, hasLength(2));
+        await tester.sendEventToBinding(pointer.scroll(delta(5)));
+        await frames(tester);
+        expect(store.requests, hasLength(2));
+        store.requests.last.respond(page(1));
+        await tester.pumpAndSettle();
+        expect(store.requests, hasLength(2));
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+      });
+    }
+
+    testWidgets('fling approaching the end loads once, reverse=$reverse',
+        (tester) async {
+      final store = RecordingFirestore();
+      final controller = ScrollController();
+      await tester.pumpWidget(pagination(store,
+          itemExtent: 250,
+          hideLaterItems: true,
+          controller: controller,
+          reverse: reverse));
+      store.requests.single.respond(page(0));
+      await tester.pumpAndSettle();
+      expect(store.requests, hasLength(1));
+      expect(controller.position.extentAfter,
+          greaterThan(controller.position.viewportDimension * .2));
+      await tester.fling(
+          find.byType(CustomScrollView), Offset(0, reverse ? 100 : -100), 1500);
+      await frames(tester);
+      expect(store.requests, hasLength(2));
+      // A quick response with no new visible height must not let the rest of
+      // the fling or bounce request further pages.
+      store.requests.last.respond(page(1));
+      await tester.pumpAndSettle();
+      expect(store.requests, hasLength(2));
+      await tester.pumpWidget(const SizedBox());
+      controller.dispose();
+    },
+        variant: const TargetPlatformVariant(
+            {TargetPlatform.android, TargetPlatform.iOS}));
+
     testWidgets(
         'zero-height rows spend the budget; one tap reads one page '
         '(reverse=$reverse)', (tester) async {

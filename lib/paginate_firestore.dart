@@ -145,7 +145,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
         if (notification.depth != 0) return false;
         if (notification is UserScrollNotification) {
           _scrollGestureAllowed =
-              notification.direction != ScrollDirection.idle &&
+              notification.direction == ScrollDirection.reverse &&
                   _nextPageRequest == null &&
                   !_cubit!.isFetching;
         }
@@ -154,7 +154,14 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           _scrollGestureAllowed =
               _nextPageRequest == null && !_cubit!.isFetching;
         }
-        if (_scrollGestureAllowed &&
+        // Increasing scroll offsets approach the next page, including in a
+        // reversed view. Starting a drag alone does not establish its direction.
+        final movingToEnd = notification is ScrollUpdateNotification &&
+                (notification.scrollDelta ?? 0) > 0 ||
+            notification is OverscrollNotification &&
+                notification.overscroll > 0;
+        if (movingToEnd &&
+            _scrollGestureAllowed &&
             _nextPageRequest == null &&
             !_cubit!.isFetching &&
             notification.metrics.extentAfter <=
