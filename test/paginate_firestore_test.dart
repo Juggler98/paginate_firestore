@@ -400,6 +400,8 @@ void main() {
     await tester.pumpWidget(buildWidget(second, isLive: true));
     expect(first.requests.single.cancelled, isTrue);
     expect(second.requests, hasLength(1));
+    // Only a refresh of the same query keeps the previous items visible.
+    expect(find.text('items/a'), findsNothing);
     first.requests.single.respond([TestDocument('items/stale')]);
     second.requests.single.respond([TestDocument('items/b')]);
     await tester.pumpAndSettle();
@@ -615,6 +617,8 @@ void main() {
     await tester.pump();
     await tester.pump();
     expect(store.requests, hasLength(3));
+    expect(find.text('items/a'), findsOneWidget);
+    expect(find.text('Load more'), findsNothing);
     store.requests.last.respond([a, b]);
     await tester.pump();
     await tester.pump();
@@ -630,7 +634,95 @@ void main() {
     refresh.dispose();
   });
 
+  for (final fails in [false, true]) {
+    testWidgets(
+        'refresh replaces retained items with ${fails ? 'an error' : 'empty results'}',
+        (tester) async {
+      final store = RecordingFirestore();
+      final refresh = PaginateRefreshedChangeListener();
+      await tester.pumpWidget(buildWidget(store, listeners: [refresh]));
+      store.requests.single.respond([TestDocument('items/a')]);
+      await tester.pumpAndSettle();
+      refresh.refreshed = true;
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('items/a'), findsOneWidget);
+      expect(store.requests, hasLength(2));
+      if (fails) {
+        store.requests.last.fail(Exception('refresh failed'));
+      } else {
+        store.requests.last.respond([]);
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('items/a'), findsNothing);
+      expect(
+          find.text(fails
+              ? 'Error occurred: Exception: refresh failed'
+              : 'No documents found'),
+          findsOneWidget);
+      expect(store.requests, hasLength(2));
+      await tester.pumpWidget(const SizedBox());
+      refresh.dispose();
+    });
+  }
+
   for (final builderType in PaginateBuilderType.values) {
+    for (final isLive in [false, true]) {
+      testWidgets(
+          'refresh keeps visible items mounted in ${builderType.name} (live: $isLive)',
+          (tester) async {
+        final store = RecordingFirestore();
+        final refresh = PaginateRefreshedChangeListener();
+        Widget widget() => buildWidget(store,
+            listeners: [refresh],
+            isLive: isLive,
+            globalLimit: 2,
+            builderType: builderType,
+            itemBuilder: (context, docs, index) =>
+                CounterItem(path: docs[index].reference.path));
+        await tester.pumpWidget(widget());
+        store.requests.single.respond([
+          TestDocument('items/a'),
+          TestDocument('items/b'),
+        ]);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('items/a: 0'));
+        await tester.pump();
+        expect(find.text('items/a: 1'), findsOneWidget);
+
+        refresh.refreshed = true;
+        await tester.pump();
+        await tester.pump();
+        expect(store.requests, hasLength(2));
+        expect(find.text('items/a: 1'), findsOneWidget);
+        // Parent rebuilds while the refresh is pending keep the same item state
+        // and must not initiate additional reads.
+        await tester.pumpWidget(widget());
+        await tester.pump(const Duration(seconds: 1));
+        expect(find.text('items/a: 1'), findsOneWidget);
+        expect(store.requests, hasLength(2));
+        if (isLive) {
+          // An empty local cache is not a confirmed empty result. Keep the
+          // existing items visible while the refreshed listener waits online.
+          store.requests.last.respond([], fromCache: true);
+          await tester.pump();
+          await tester.pump();
+          expect(find.text('items/a: 1'), findsOneWidget);
+          expect(store.requests, hasLength(2));
+        }
+        store.requests.last.respond([
+          TestDocument('items/a'),
+          TestDocument('items/c'),
+        ]);
+        await tester.pumpAndSettle();
+        expect(find.text('items/a: 1'), findsOneWidget);
+        expect(find.text('items/b: 0'), findsNothing);
+        expect(store.requests, hasLength(2));
+        await tester.pumpWidget(const SizedBox());
+        refresh.dispose();
+      });
+    }
+
     testWidgets('live reordering preserves item state in ${builderType.name}',
         (tester) async {
       final store = RecordingFirestore();

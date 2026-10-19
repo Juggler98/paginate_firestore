@@ -128,6 +128,9 @@ class PaginateFirestore extends StatefulWidget {
 
 class _PaginateFirestoreState extends State<PaginateFirestore> {
   PaginationCubit? _cubit;
+  // Display-only state keeps items mounted during a refresh of the same query.
+  // Request cursors and budgets still belong to the new pagination session.
+  PaginationLoaded? _lastLoadedState;
   Future<void>? _nextPageRequest;
   final _paginationControlKey = GlobalKey();
   int _automaticFillPages = 0;
@@ -184,6 +187,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             _resetAutomaticFill();
           }
           if (state is PaginationError) {
+            _lastLoadedState = null;
             // A successful explicit retry restores pages, but does not grant
             // an additional automatic fetch beyond the failed request.
             _automaticFillStopped = true;
@@ -191,6 +195,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
             _scrollGestureAllowed = false;
           }
           if (state is PaginationLoaded) {
+            _lastLoadedState = state;
             widget.onLoaded?.call(state);
             if (state.hasReachedEnd) {
               _automaticFillStopped = true;
@@ -199,14 +204,15 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           }
         },
         builder: (context, state) {
-          if (state is PaginationInitial) {
+          if (state is PaginationInitial && _lastLoadedState == null) {
             return widget.initialLoader;
           } else if (state is PaginationError) {
             return (widget.onError != null)
                 ? widget.onError!(state.error)
                 : ErrorDisplay(exception: state.error);
           } else {
-            final loadedState = state as PaginationLoaded;
+            final loadedState =
+                state is PaginationLoaded ? state : _lastLoadedState!;
             if (loadedState.documentSnapshots.isEmpty &&
                 (loadedState.hasReachedEnd ||
                     widget.itemBuilderType == PaginateBuilderType.pageView)) {
@@ -330,6 +336,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   }
 
   void _createCubit() {
+    _lastLoadedState = null;
     _resetAutomaticFill();
     _cubit = PaginationCubit(
       widget.query,
@@ -452,7 +459,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     _schedulePaginationCheck();
     return KeyedSubtree(
       key: _paginationControlKey,
-      child: _nextPageRequest != null
+      child: _nextPageRequest != null || _cubit!.state is PaginationInitial
           ? widget.bottomLoader
           : Center(
               child: TextButton(

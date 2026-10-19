@@ -86,7 +86,10 @@ Pages use `startAfterDocument` and `limit`, so scrolling fetches the next page
 without fetching all previous pages again. Concurrent fetch calls share one
 request. A refresh cancels existing listeners and starts again from the original
 cursor; results from older requests are ignored. Refreshing deliberately reads
-the first page again.
+the first page again. Existing items remain visible while that refresh is pending,
+then the refreshed results replace them. The initial loader is used for the first
+load or a new pagination query; refresh errors still use the configured error
+widget. Keeping items visible does not issue additional Firestore requests.
 
 `itemsGlobalLimit` caps the total document slots requested across pages. For
 example, `itemsPerPage: 15` and `itemsGlobalLimit: 25` request 15 documents, then
