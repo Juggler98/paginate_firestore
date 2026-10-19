@@ -130,15 +130,18 @@ if later filtering or live deletions make the content shorter. Real user scrolli
 toward the next page near the end continues pagination, with one page per
 qualifying user scroll action and one request in flight at a time.
 Rebuilds, programmatic scrolling, and a continuously visible loader do not request
-more pages. When filling stops, **Load more** remains available; each tap requests
-exactly one page and does not start another fill cycle.
+more pages. Filled list/grid viewports keep the trailing `bottomLoader`, including
+between gestures and page responses. **Load more** is reserved for underfilled
+viewports after automatic filling has stopped, and for the fallback layouts
+described below. Each tap requests exactly one page and does not start another
+fill cycle. If that page fills the viewport, normal scrolling resumes.
 
-The trailing control shows `bottomLoader` while scrolling, loading, or checking
-whether to fill the viewport. The manual button appears when scrolling stops and
-manual loading is available; showing the spinner does not request a page. Both
-controls share a stable slot to avoid scroll jumps when switching. In lists the
-loader sits after the last separator inside `padding`; in grids it occupies the
-next grid cell, matching the original loader placement.
+The loader animates during scrolling/loading and remains a static placeholder
+while idle; displaying it does not request a page. When manual loading is needed,
+the button appears once scrolling and loading have stopped. Both controls share
+a stable slot to avoid scroll jumps when switching. In lists the loader sits
+after the last separator inside `padding`; in grids it occupies the next grid
+cell, matching the original loader placement.
 
 Layout detection supports list/grid views in either scroll direction, reversed
 lists such as chats, and shrink-wrapped views with a finite available viewport.

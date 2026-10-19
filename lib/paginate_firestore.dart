@@ -431,11 +431,6 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       _fetchNextPage();
       return;
     }
-    if (_automaticFillStopped) {
-      _showManualControl();
-      return;
-    }
-
     // PageView only prefetches when its trailing page is built.
     if (fallback && controlContext == null) return;
 
@@ -446,7 +441,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       // A lazy list/grid whose tail is not built already fills its viewport.
       if (controlContext == null) {
         _automaticFillStopped = true;
-        _showManualControl();
+        _setManualControl(false);
         return;
       }
       final control = controlContext.findRenderObject();
@@ -474,23 +469,27 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       });
       if (contentExtent >= _availableViewportExtent - .5) {
         _automaticFillStopped = true;
-        _showManualControl();
+        // Filling the viewport enables normal scrolling. It is not a reason
+        // to show the manual fallback between gestures or page responses.
+        _setManualControl(false);
         return;
       }
     }
     final budget = fallback
         ? min(1, widget.maxAutomaticFillPages)
         : widget.maxAutomaticFillPages;
-    if (_automaticFillPages >= budget) {
-      _showManualControl();
+    if (_automaticFillStopped || _automaticFillPages >= budget) {
+      _setManualControl(true);
       return;
     }
     _automaticFillPages++;
     _fetchNextPage();
   }
 
-  void _showManualControl() {
-    if (!_showManualLoadMore) setState(() => _showManualLoadMore = true);
+  void _setManualControl(bool visible) {
+    if (_showManualLoadMore != visible) {
+      setState(() => _showManualLoadMore = visible);
+    }
   }
 
   void _fetchNextPage() {
@@ -521,11 +520,11 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   Widget _buildPaginationControl(BuildContext context) {
     _schedulePaginationCheck();
     final scrollable = Scrollable.of(context);
-    final showLoader = scrollable.position.isScrollingNotifier.value ||
-        !_showManualLoadMore ||
-        _nextPageRequest != null ||
+    final isScrolling = scrollable.position.isScrollingNotifier.value;
+    final isLoading = _nextPageRequest != null ||
         _cubit!.isFetching ||
         _cubit!.state is PaginationInitial;
+    final showLoader = isScrolling || isLoading || !_showManualLoadMore;
     return IndexedStack(
       key: _paginationControlKey,
       // Reserve the same space for both controls. Changing the trailing extent
@@ -538,7 +537,11 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
         AxisDirection.left => Alignment.centerRight,
       },
       children: [
-        TickerMode(enabled: showLoader, child: widget.bottomLoader),
+        // An idle scrollable list keeps the loader as its trailing placeholder.
+        // Animate only during movement/loading, not indefinitely in the cache.
+        TickerMode(
+            enabled: showLoader && (isScrolling || isLoading),
+            child: widget.bottomLoader),
         Center(
           child: TextButton(
             onPressed: () {

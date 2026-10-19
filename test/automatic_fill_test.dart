@@ -177,6 +177,51 @@ void main() {
     PaginateBuilderType.gridView
   ]) {
     for (final reverse in [false, true]) {
+      testWidgets(
+          '${type.name} normal pagination never offers manual loading between flings, '
+          'reverse=$reverse', (tester) async {
+        final store = RecordingFirestore();
+        final controller = ScrollController();
+        Widget build() => pagination(store,
+            type: type,
+            reverse: reverse,
+            controller: controller,
+            live: true,
+            itemExtent: type == PaginateBuilderType.gridView ? 400 : 200);
+        await tester.pumpWidget(build());
+        store.requests.single.respond(page(0));
+        await tester.pumpAndSettle();
+        // Normal filled content must not select the manual fallback, even
+        // during the idle gap between consecutive fast gestures.
+        expect(button, findsNothing);
+        for (var nextPage = 1; nextPage <= 3; nextPage++) {
+          controller.jumpTo(controller.position.maxScrollExtent);
+          await tester.pumpAndSettle();
+          expect(store.requests, hasLength(nextPage));
+          expect(button, findsNothing);
+          await tester.fling(find.byType(CustomScrollView),
+              Offset(0, reverse ? 80 : -80), 2000);
+          await frames(tester);
+          expect(store.requests, hasLength(nextPage + 1));
+          expect(button, findsNothing);
+          store.requests.last.respond(page(nextPage));
+          for (var frame = 0; frame < 8; frame++) {
+            await tester.pump(const Duration(milliseconds: 16));
+            expect(button, findsNothing);
+          }
+          await tester.pumpAndSettle();
+          expect(button, findsNothing);
+          expect(store.requests, hasLength(nextPage + 1));
+          store.requests.last.respond(page(nextPage), metadataOnly: true);
+          await tester.pumpWidget(build());
+          await tester.pumpAndSettle();
+          expect(button, findsNothing);
+          expect(store.requests, hasLength(nextPage + 1));
+        }
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+      });
+
       for (final axis in Axis.values) {
         testWidgets(
             '${type.name} keeps the loader inside padding, '
@@ -232,6 +277,7 @@ void main() {
         }
         await tester.pumpAndSettle();
         expect(store.requests, hasLength(3));
+        expect(button, findsNothing);
 
         // Programmatic movement and the continuously visible control do not
         // spend the remaining automatic allowance after the viewport is full.
@@ -392,7 +438,7 @@ void main() {
       }
       await tester.pumpAndSettle();
       expect(store.requests, hasLength(2));
-      expect(button, findsOneWidget);
+      expect(button, findsNothing);
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
     },
@@ -446,6 +492,33 @@ void main() {
     expect(store.requests, hasLength(2));
   });
 
+  testWidgets('manual fallback disappears when its page fills the viewport',
+      (tester) async {
+    final store = RecordingFirestore();
+    final controller = ScrollController();
+    await tester
+        .pumpWidget(pagination(store, budget: 1, controller: controller));
+    store.requests.single.respond(page(0));
+    await frames(tester);
+    store.requests.last.respond(page(1));
+    await tester.pumpAndSettle();
+    expect(store.requests, hasLength(2));
+    expect(button, findsOneWidget);
+    await tester.tap(button);
+    await frames(tester);
+    expect(store.requests, hasLength(3));
+    store.requests.last.respond(page(2));
+    await tester.pumpAndSettle();
+    expect(button, findsNothing);
+    controller.jumpTo(controller.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(button, findsNothing);
+    expect(find.byType(BottomLoader), findsOneWidget);
+    expect(store.requests, hasLength(3));
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+  });
+
   testWidgets('one continuing gesture cannot chain no-growth pages',
       (tester) async {
     final store = RecordingFirestore();
@@ -470,7 +543,13 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
     expect(store.requests, hasLength(2));
-    expect(button, findsOneWidget);
+    expect(button, findsNothing);
+    // Keeping the placeholder does not turn a continuing gesture or idle
+    // rebuild into more reads. A fresh user scroll still requests one page.
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -60));
+    await frames(tester);
+    expect(store.requests, hasLength(3));
+    expect(button, findsNothing);
   });
 
   testWidgets(
