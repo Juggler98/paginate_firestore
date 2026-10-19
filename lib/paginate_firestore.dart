@@ -36,6 +36,7 @@ class PaginateFirestore extends StatefulWidget {
     this.separator = const EmptySeparator(),
     this.initialLoader = const InitialLoader(),
     this.bottomLoader = const BottomLoader(),
+    this.loadMoreLabel = 'Load more',
     this.shrinkWrap = false,
     this.reverse = false,
     this.scrollDirection = Axis.vertical,
@@ -57,6 +58,10 @@ class PaginateFirestore extends StatefulWidget {
         assert(itemsGlobalLimit == null || itemsGlobalLimit >= 0);
 
   final Widget bottomLoader;
+
+  /// Label for the manual loading button. Pass your app's localized string.
+  final String loadMoreLabel;
+
   final Widget onEmpty;
   final SliverGridDelegate gridDelegate;
   final Widget initialLoader;
@@ -327,7 +332,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     return Center(
       child: TextButton(
         onPressed: () => setState(() => _automaticFetchAllowed = true),
-        child: const Text('Load more'),
+        child: Text(widget.loadMoreLabel),
       ),
     );
   }

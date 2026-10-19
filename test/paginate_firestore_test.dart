@@ -14,6 +14,7 @@ void main() {
     ScrollController? controller,
     void Function(PaginationLoaded)? onLoaded,
     int pageSize = 2,
+    String loadMoreLabel = 'Load more',
     bool isLive = false,
     bool isAllItemsLive = true,
     bool includeMetadataChanges = false,
@@ -28,6 +29,7 @@ void main() {
     final pagination = PaginateFirestore(
       query: store.query,
       itemsPerPage: pageSize,
+      loadMoreLabel: loadMoreLabel,
       itemBuilderType: builderType,
       pageController: pageController,
       listeners: listeners,
@@ -96,6 +98,41 @@ void main() {
       controller.dispose();
     });
   }
+
+  testWidgets('custom load more label still loads the next page',
+      (tester) async {
+    final store = RecordingFirestore();
+    const label = 'Načítať ďalšie';
+    await tester.pumpWidget(buildWidget(store, loadMoreLabel: label));
+    store.requests.single.respond([
+      TestDocument('items/a'),
+      TestDocument('items/b'),
+    ]);
+    await tester.pump();
+    await tester.pump();
+    expect(store.requests, hasLength(2));
+    store.requests.last.respond([
+      TestDocument('items/c'),
+      TestDocument('items/d'),
+    ]);
+    await tester.pumpAndSettle();
+
+    final button = find.widgetWithText(TextButton, label);
+    expect(button, findsOneWidget);
+    expect(find.text('Load more'), findsNothing);
+    expect(store.requests, hasLength(2));
+
+    await tester.tap(button);
+    await tester.pump();
+    expect(store.requests, hasLength(3));
+    expect(store.requests.last.query.cursor!.reference.path, 'items/d');
+    store.requests.last.respond([TestDocument('items/e')]);
+    await tester.pumpAndSettle();
+    expect(find.text('items/e'), findsOneWidget);
+    expect(button, findsNothing);
+    expect(store.requests, hasLength(3));
+    await tester.pumpWidget(const SizedBox());
+  });
 
   for (final builderType in [
     PaginateBuilderType.listView,

@@ -116,6 +116,15 @@ rows, filtered-out results, or `shrinkWrap: true` in an outer scroll view from
 automatically draining the collection. Programmatic scrolling does not renew the
 allowance; the **Load more** button remains available.
 
+Use `loadMoreLabel` (default: `'Load more'`) to supply the button text from your
+app's existing localization system. No localization dependency is required by
+this package:
+
+```dart
+// In PaginateFirestore, using your app's AppLocalizations:
+loadMoreLabel: AppLocalizations.of(context)!.loadMore,
+```
+
 Errors stop automatic pagination; there is no automatic retry timer or loop.
 An explicit **retry** requests one failed page, using its original query, cursor,
 and limit. Successful pages and healthy live listeners are retained.
