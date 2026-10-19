@@ -37,6 +37,7 @@ class PaginateFirestore extends StatefulWidget {
     this.initialLoader = const InitialLoader(),
     this.bottomLoader = const BottomLoader(),
     this.loadMoreLabel = 'Load more',
+    this.maxAutomaticFillPages = 3,
     this.shrinkWrap = false,
     this.reverse = false,
     this.scrollDirection = Axis.vertical,
@@ -55,12 +56,20 @@ class PaginateFirestore extends StatefulWidget {
     this.includeMetadataChanges = false,
     this.options,
   })  : assert(itemsPerPage > 0),
+        assert(maxAutomaticFillPages >= 0),
         assert(itemsGlobalLimit == null || itemsGlobalLimit >= 0);
 
   final Widget bottomLoader;
 
   /// Label for the manual loading button. Pass your app's localized string.
   final String loadMoreLabel;
+
+  /// Maximum additional page requests used to fill the initial viewport.
+  /// Defaults to 3; zero disables automatic filling. Hidden items count too.
+  /// Refreshes and new pagination queries reset this budget; retries do not.
+  /// This is not a cap on Firestore billing, live reads, or user-requested pages.
+  /// PageView and unbounded nested layouts prefetch at most one extra page.
+  final int maxAutomaticFillPages;
 
   final Widget onEmpty;
   final SliverGridDelegate gridDelegate;
@@ -120,22 +129,41 @@ class PaginateFirestore extends StatefulWidget {
 class _PaginateFirestoreState extends State<PaginateFirestore> {
   PaginationCubit? _cubit;
   Future<void>? _nextPageRequest;
-  // A visible loader may prefetch one page per session or user scroll. Rebuilds,
-  // filtered-out results and live events must not replenish this allowance.
-  bool _automaticFetchAllowed = true;
+  final _paginationControlKey = GlobalKey();
+  int _automaticFillPages = 0;
+  bool _automaticFillStopped = false;
+  bool _scrollGestureAllowed = false;
+  bool _scrollRequestAllowed = false;
+  bool _paginationCheckScheduled = false;
+  double _availableViewportExtent = double.infinity;
   List<ChangeNotifier> _attachedListeners = [];
 
   @override
   Widget build(BuildContext context) {
-    return NotificationListener<UserScrollNotification>(
+    return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
-        if (notification.depth == 0 &&
-            notification.direction != ScrollDirection.idle &&
-            !_automaticFetchAllowed) {
-          _automaticFetchAllowed = true;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) setState(() {});
-          });
+        if (notification.depth != 0) return false;
+        if (notification is UserScrollNotification) {
+          _scrollGestureAllowed =
+              notification.direction != ScrollDirection.idle &&
+                  _nextPageRequest == null &&
+                  !_cubit!.isFetching;
+        }
+        if (notification is ScrollStartNotification &&
+            notification.dragDetails != null) {
+          _scrollGestureAllowed =
+              _nextPageRequest == null && !_cubit!.isFetching;
+        }
+        if (_scrollGestureAllowed &&
+            _nextPageRequest == null &&
+            !_cubit!.isFetching &&
+            notification.metrics.extentAfter <=
+                notification.metrics.viewportDimension * .2) {
+          // Consume this scroll action, including its ballistic updates. A fast
+          // no-growth response must not turn a continuing fling into a loop.
+          _scrollGestureAllowed = false;
+          _scrollRequestAllowed = true;
+          _schedulePaginationCheck();
         }
         return false;
       },
@@ -146,17 +174,21 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           if (state is PaginationInitial) {
             // A previous one-time read may still be in flight. It must not
             // block the loader in the refreshed pagination session.
-            _nextPageRequest = null;
-            _automaticFetchAllowed = true;
+            _resetAutomaticFill();
           }
           if (state is PaginationError) {
             // A successful explicit retry restores pages, but does not grant
             // an additional automatic fetch beyond the failed request.
-            _automaticFetchAllowed = false;
+            _automaticFillStopped = true;
+            _scrollRequestAllowed = false;
+            _scrollGestureAllowed = false;
           }
           if (state is PaginationLoaded) {
             widget.onLoaded?.call(state);
-            if (state.hasReachedEnd) widget.onReachedEnd?.call(state);
+            if (state.hasReachedEnd) {
+              _automaticFillStopped = true;
+              widget.onReachedEnd?.call(state);
+            }
           }
         },
         builder: (context, state) {
@@ -168,14 +200,22 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                 : ErrorDisplay(exception: state.error);
           } else {
             final loadedState = state as PaginationLoaded;
-            if (loadedState.documentSnapshots.isEmpty) {
+            if (loadedState.documentSnapshots.isEmpty &&
+                (loadedState.hasReachedEnd ||
+                    widget.itemBuilderType == PaginateBuilderType.pageView)) {
               return widget.onEmpty;
             }
-            return widget.itemBuilderType == PaginateBuilderType.listView
-                ? _buildListView(loadedState)
-                : widget.itemBuilderType == PaginateBuilderType.gridView
-                    ? _buildGridView(loadedState)
-                    : _buildPageView(loadedState);
+            return LayoutBuilder(builder: (context, constraints) {
+              _availableViewportExtent = widget.scrollDirection == Axis.vertical
+                  ? constraints.maxHeight
+                  : constraints.maxWidth;
+              _schedulePaginationCheck();
+              return widget.itemBuilderType == PaginateBuilderType.listView
+                  ? _buildListView(loadedState)
+                  : widget.itemBuilderType == PaginateBuilderType.gridView
+                      ? _buildGridView(loadedState)
+                      : _buildPageView(loadedState);
+            });
           }
         },
       ),
@@ -283,8 +323,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   }
 
   void _createCubit() {
-    _nextPageRequest = null;
-    _automaticFetchAllowed = true;
+    _resetAutomaticFill();
     _cubit = PaginationCubit(
       widget.query,
       widget.itemsPerPage,
@@ -297,17 +336,96 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     )..fetchPaginatedList();
   }
 
+  void _resetAutomaticFill() {
+    _nextPageRequest = null;
+    _automaticFillPages = 0;
+    _automaticFillStopped = false;
+    _scrollRequestAllowed = false;
+    _scrollGestureAllowed = false;
+  }
+
+  void _schedulePaginationCheck() {
+    if (_paginationCheckScheduled) return;
+    _paginationCheckScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _paginationCheckScheduled = false;
+      if (mounted) _checkPaginationLayout();
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _checkPaginationLayout() {
+    final scrollRequested = _scrollRequestAllowed;
+    _scrollRequestAllowed = false;
+    if (_nextPageRequest != null) return;
+    final cubit = _cubit!;
+    final state = cubit.state;
+    if (state is! PaginationLoaded || state.hasReachedEnd) return;
+    final controlContext = _paginationControlKey.currentContext;
+    if (controlContext == null) return;
+    final position = Scrollable.maybeOf(controlContext)?.position;
+    if (position == null || !position.hasContentDimensions) return;
+
+    // Join an in-flight initial/cache confirmation without spending the budget.
+    // Metadata-only confirmation need not emit another loaded state.
+    if (cubit.isFetching) {
+      _fetchNextPage();
+      return;
+    }
+
+    final unbounded = !_availableViewportExtent.isFinite;
+    final fallback =
+        widget.itemBuilderType == PaginateBuilderType.pageView || unbounded;
+    // An unbounded inner scroll view cannot identify the outer visible end.
+    // Even gestures accepted by that inner view must use the manual fallback.
+    if (!unbounded &&
+        scrollRequested &&
+        position.extentAfter <= position.viewportDimension * .2) {
+      _automaticFillStopped = true;
+      _fetchNextPage();
+      return;
+    }
+    if (_automaticFillStopped) return;
+
+    if (!fallback) {
+      final control = controlContext.findRenderObject();
+      if (control is! RenderBox ||
+          !control.hasSize ||
+          _availableViewportExtent <= 0 ||
+          position.viewportDimension <= 0) {
+        return;
+      }
+      final controlExtent = widget.scrollDirection == Axis.vertical
+          ? control.size.height
+          : control.size.width;
+      // Exclude the loading control itself. Extents work in both directions and
+      // also let a bounded shrink-wrapped viewport grow to its available size.
+      final contentExtent = position.maxScrollExtent -
+          position.minScrollExtent +
+          position.viewportDimension -
+          controlExtent;
+      if (contentExtent >= _availableViewportExtent - .5) {
+        _automaticFillStopped = true;
+        return;
+      }
+    }
+    final budget = fallback
+        ? min(1, widget.maxAutomaticFillPages)
+        : widget.maxAutomaticFillPages;
+    if (_automaticFillPages >= budget) return;
+    _automaticFillPages++;
+    _fetchNextPage();
+  }
+
   void _fetchNextPage() {
-    if (_nextPageRequest != null || !_automaticFetchAllowed) return;
+    if (_nextPageRequest != null) return;
     final cubit = _cubit!;
     final currentState = cubit.state;
     // A stale loader must not turn an error into an implicit retry.
     if (currentState is! PaginationLoaded || currentState.hasReachedEnd) return;
-    // Waiting for the initial cached page's confirmation does not request a new
-    // page and must not consume the prefetch allowance.
-    if (!cubit.isFetching) _automaticFetchAllowed = false;
     final request = cubit.fetchPaginatedList();
     _nextPageRequest = request;
+    setState(() {});
     unawaited(request.then((_) {
       if (!identical(_nextPageRequest, request)) return;
       _nextPageRequest = null;
@@ -324,16 +442,21 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   }
 
   Widget _buildPaginationControl() {
-    if (_nextPageRequest != null) return widget.bottomLoader;
-    if (_automaticFetchAllowed) {
-      _fetchNextPage();
-      return widget.bottomLoader;
-    }
-    return Center(
-      child: TextButton(
-        onPressed: () => setState(() => _automaticFetchAllowed = true),
-        child: Text(widget.loadMoreLabel),
-      ),
+    _schedulePaginationCheck();
+    return KeyedSubtree(
+      key: _paginationControlKey,
+      child: _nextPageRequest != null
+          ? widget.bottomLoader
+          : Center(
+              child: TextButton(
+                onPressed: () {
+                  _automaticFillStopped = true;
+                  _scrollRequestAllowed = false;
+                  _fetchNextPage();
+                },
+                child: Text(widget.loadMoreLabel),
+              ),
+            ),
     );
   }
 
@@ -358,15 +481,14 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       keyboardDismissBehavior: widget.keyboardDismissBehavior,
       slivers: [
         if (widget.header != null) widget.header!,
+        if (loadedState.documentSnapshots.isEmpty)
+          SliverToBoxAdapter(child: widget.onEmpty),
         SliverPadding(
           padding: widget.padding,
           sliver: SliverGrid(
             gridDelegate: widget.gridDelegate,
             delegate: SliverChildBuilderDelegate(
               (context, index) {
-                if (index >= loadedState.documentSnapshots.length) {
-                  return _buildPaginationControl();
-                }
                 final doc = loadedState.documentSnapshots[index];
                 return KeyedSubtree(
                   key: ValueKey(doc.reference.path),
@@ -377,13 +499,13 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                   ),
                 );
               },
-              childCount: loadedState.hasReachedEnd
-                  ? loadedState.documentSnapshots.length
-                  : loadedState.documentSnapshots.length + 1,
+              childCount: loadedState.documentSnapshots.length,
               findChildIndexCallback: _documentIndexLookup(loadedState),
             ),
           ),
         ),
+        if (!loadedState.hasReachedEnd)
+          SliverToBoxAdapter(child: _buildPaginationControl()),
         if (widget.footer != null) widget.footer!,
       ],
     );
@@ -410,6 +532,8 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       keyboardDismissBehavior: widget.keyboardDismissBehavior,
       slivers: [
         if (widget.header != null) widget.header!,
+        if (loadedState.documentSnapshots.isEmpty)
+          SliverToBoxAdapter(child: widget.onEmpty),
         SliverPadding(
           padding: widget.padding,
           sliver: SliverList(
@@ -417,9 +541,6 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               (context, index) {
                 final itemIndex = index ~/ 2;
                 if (index.isEven) {
-                  if (itemIndex >= loadedState.documentSnapshots.length) {
-                    return _buildPaginationControl();
-                  }
                   final doc = loadedState.documentSnapshots[itemIndex];
                   return KeyedSubtree(
                     key: ValueKey(doc.reference.path),
@@ -441,16 +562,15 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               },
               findChildIndexCallback:
                   _documentIndexLookup(loadedState, stride: 2),
-              childCount: max(
-                  0,
-                  (loadedState.hasReachedEnd
-                              ? loadedState.documentSnapshots.length
-                              : loadedState.documentSnapshots.length + 1) *
-                          2 -
-                      1),
+              childCount: max(0, loadedState.documentSnapshots.length * 2 - 1),
             ),
           ),
         ),
+        if (!loadedState.hasReachedEnd &&
+            loadedState.documentSnapshots.isNotEmpty)
+          SliverToBoxAdapter(child: widget.separator),
+        if (!loadedState.hasReachedEnd)
+          SliverToBoxAdapter(child: _buildPaginationControl()),
         if (widget.footer != null) widget.footer!,
       ],
     );

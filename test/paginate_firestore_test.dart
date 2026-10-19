@@ -29,6 +29,9 @@ void main() {
     final pagination = PaginateFirestore(
       query: store.query,
       itemsPerPage: pageSize,
+      // Exercise the existing one-page-budget regressions. The default budget
+      // and layout-driven filling have dedicated tests in automatic_fill_test.
+      maxAutomaticFillPages: 1,
       loadMoreLabel: loadMoreLabel,
       itemBuilderType: builderType,
       pageController: pageController,

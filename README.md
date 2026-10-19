@@ -107,14 +107,45 @@ live updates. Neither mode automatically refreshes historical pages to keep them
 fresh; choose based on what the screen needs.
 
 Larger pages reduce request/listener count but can fetch documents the user never
-views. Scrolling prefetches when Flutter builds the bottom loader, which can occur
-just before it becomes visible. After the initial page, the widget automatically
-requests at most one next page without another user action. Further pages require
-scrolling the pagination view or pressing **Load more**. Rebuilds, metadata events,
-local filtering, and live updates do not renew this allowance. This prevents small
-rows, filtered-out results, or `shrinkWrap: true` in an outer scroll view from
-automatically draining the collection. Programmatic scrolling does not renew the
-allowance; the **Load more** button remains available.
+views. After the initial page, list and grid views check their actual scroll layout
+after the frame and fetch another page if the content does not fill the viewport.
+This repeats until the viewport is full, the end is confirmed, `itemsGlobalLimit`
+is reached, or `maxAutomaticFillPages` is exhausted.
+
+`maxAutomaticFillPages` defaults to **3 additional page requests** after the initial
+page. Set it to `0` to disable automatic filling. Every automatic fill request
+counts, including pages whose items are filtered out, hidden, or add no visible
+height. This bounds **automatic page requests**, not total Firestore billing,
+live-listener reads, or pages requested by the user. Rebuilds, cache/server
+confirmations, metadata events, filter notifications, and live updates do not
+reset the budget. Explicit refreshes and new pagination queries/settings start a
+new session and reset it. Errors stop filling; retry retains successful pages
+and does not reset or resume the automatic-fill cycle.
+
+Once content fills the viewport, automatic filling stops for that session, even
+if later filtering or live deletions make the content shorter. Real user scrolling
+near the end continues normal pagination, with one page per qualifying user
+scroll action and one request in flight at a time.
+Rebuilds, programmatic scrolling, and a continuously visible loader do not request
+more pages. When filling stops, **Load more** remains available; each tap requests
+exactly one page and does not start another fill cycle.
+
+Layout detection supports list/grid views in either scroll direction, reversed
+lists such as chats, and shrink-wrapped views with a finite available viewport.
+In an **unbounded nested layout**, such as a shrink-wrapped view inside a
+`SingleChildScrollView`, the inner widget cannot reliably measure the outer visible
+viewport. It conservatively prefetches at most one extra page (or zero with a zero
+budget), then uses the manual button; scrolling either view does not load more.
+Give the pagination view a bounded size to enable viewport filling and infinite
+scrolling. `PageView` retains its existing behavior: at most one automatic extra
+page when the trailing control is built, followed by user scrolling or the button.
+The configured budget can disable that prefetch but does not turn PageView into
+a viewport-fill loop.
+
+```dart
+// In PaginateFirestore:
+maxAutomaticFillPages: 3, // Extra page requests, not a document/read billing cap.
+```
 
 Use `loadMoreLabel` (default: `'Load more'`) to supply the button text from your
 app's existing localization system. No localization dependency is required by
