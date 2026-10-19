@@ -3,12 +3,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:paginate_firestore/bloc/pagination_listeners.dart';
 import 'package:paginate_firestore/paginate_firestore.dart';
+import 'package:paginate_firestore/widgets/bottom_loader.dart';
 
 import 'support/firestore_fakes.dart';
 
 Widget pagination(
   RecordingFirestore store, {
   int? budget,
+  int pageSize = 2,
   int? globalLimit,
   double itemExtent = 50,
   bool hidden = false,
@@ -23,10 +25,12 @@ Widget pagination(
   List<ChangeNotifier>? listeners,
   ScrollController? controller,
   PageController? pageController,
+  EdgeInsets padding = EdgeInsets.zero,
+  Widget separator = const SizedBox.shrink(),
 }) {
   final view = PaginateFirestore(
     query: store.query,
-    itemsPerPage: 2,
+    itemsPerPage: pageSize,
     // The public default is separately asserted below.
     maxAutomaticFillPages: budget ?? 3,
     itemsGlobalLimit: globalLimit,
@@ -36,6 +40,8 @@ Widget pagination(
     scrollDirection: axis,
     scrollController: controller,
     pageController: pageController,
+    padding: padding,
+    separator: separator,
     isLive: live,
     includeMetadataChanges: metadata,
     listeners: listeners,
@@ -97,11 +103,117 @@ void main() {
     expect(widget.maxAutomaticFillPages, 3);
   });
 
+  testWidgets('automatic filling never flashes the manual button between pages',
+      (tester) async {
+    final store = RecordingFirestore();
+    await tester.pumpWidget(pagination(store, hidden: true));
+    for (var i = 0; i < 3; i++) {
+      store.requests.last.respond(page(i));
+      for (var frame = 0; frame < 5; frame++) {
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(button, findsNothing);
+      }
+      expect(store.requests, hasLength(i + 2));
+      expect(find.byType(BottomLoader), findsOneWidget);
+    }
+    store.requests.last.respond(page(3));
+    await tester.pumpAndSettle();
+    expect(button, findsOneWidget);
+    expect(store.requests, hasLength(4));
+  });
+
+  testWidgets('cached results show a spinner while waiting for the server',
+      (tester) async {
+    final store = RecordingFirestore();
+    await tester.pumpWidget(pagination(store, live: true, budget: 0));
+    store.requests.single.respond(page(0), fromCache: true);
+    for (var frame = 0; frame < 5; frame++) {
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(button, findsNothing);
+    }
+    expect(find.byType(BottomLoader), findsOneWidget);
+    expect(store.requests, hasLength(1));
+    store.requests.single.respond(page(0), metadataOnly: true);
+    await tester.pumpAndSettle();
+    expect(button, findsOneWidget);
+    expect(store.requests, hasLength(1));
+  });
+
+  for (final itemExtent in [100.0, 150.0]) {
+    testWidgets('grid loader sharing a row respects actual height $itemExtent',
+        (tester) async {
+      final store = RecordingFirestore();
+      await tester.pumpWidget(pagination(store,
+          type: PaginateBuilderType.gridView,
+          pageSize: 3,
+          itemExtent: itemExtent));
+      store.requests.single.respond([
+        TestDocument('items/a'),
+        TestDocument('items/b'),
+        TestDocument('items/c'),
+      ]);
+      await frames(tester);
+      // Three documents occupy two rows; the control shares the second row.
+      // Two 100px rows need another page, but two 150px rows fill the viewport.
+      expect(store.requests, hasLength(itemExtent == 100 ? 2 : 1));
+      if (itemExtent == 100) {
+        final loader = tester.getRect(find.byType(BottomLoader));
+        final last = tester.getRect(find.byKey(const ValueKey('items/c')));
+        expect(loader.top, last.top);
+        expect(loader.left, last.right);
+        store.requests.last.respond([
+          TestDocument('items/d'),
+          TestDocument('items/e'),
+          TestDocument('items/f'),
+        ]);
+      }
+      await tester.pumpAndSettle();
+      expect(store.requests, hasLength(itemExtent == 100 ? 2 : 1));
+    });
+  }
+
   for (final type in [
     PaginateBuilderType.listView,
     PaginateBuilderType.gridView
   ]) {
     for (final reverse in [false, true]) {
+      for (final axis in Axis.values) {
+        testWidgets(
+            '${type.name} keeps the loader inside padding, '
+            '${axis.name}, reverse=$reverse', (tester) async {
+          final store = RecordingFirestore();
+          await tester.pumpWidget(pagination(store,
+              type: type,
+              axis: axis,
+              reverse: reverse,
+              padding: const EdgeInsets.fromLTRB(17, 23, 41, 29),
+              separator: const SizedBox(width: 13, height: 13)));
+          store.requests.single.respond(page(0));
+          await frames(tester);
+          expect(store.requests, hasLength(2));
+          final loader = tester.getRect(find.byType(BottomLoader));
+          final first = tester.getRect(find.byKey(const ValueKey('items/0')));
+          final last = tester.getRect(find.byKey(const ValueKey('items/1')));
+          final gap = type == PaginateBuilderType.listView ? 13 : 0;
+          if (axis == Axis.vertical) {
+            expect(loader.left, first.left);
+            expect(loader.right, first.right);
+            expect(reverse ? loader.bottom : loader.top,
+                reverse ? last.top - gap : last.bottom + gap);
+          } else {
+            expect(loader.top, first.top);
+            expect(loader.bottom, first.bottom);
+            expect(reverse ? loader.right : loader.left,
+                reverse ? last.left - gap : last.right + gap);
+          }
+          expect(
+              find.ancestor(
+                  of: find.byType(BottomLoader),
+                  matching: find.byType(SliverPadding)),
+              findsOneWidget);
+        });
+      }
+
       testWidgets(
           '${type.name}, reverse=$reverse fills then waits for scrolling',
           (tester) async {
@@ -147,6 +259,39 @@ void main() {
         store.requests.last.respond(page(3));
         await tester.pumpAndSettle();
         expect(store.requests, hasLength(4));
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+      });
+
+      testWidgets(
+          '${type.name} fast scrolling shows the spinner in the request frame, '
+          'reverse=$reverse', (tester) async {
+        final store = RecordingFirestore();
+        final controller = ScrollController();
+        await tester.pumpWidget(pagination(store,
+            type: type,
+            reverse: reverse,
+            controller: controller,
+            itemExtent: type == PaginateBuilderType.gridView ? 400 : 200,
+            budget: 0));
+        store.requests.single.respond(page(0));
+        await tester.pumpAndSettle();
+        controller.jumpTo(controller.position.maxScrollExtent);
+        await tester.pumpAndSettle();
+        final gesture = await tester.startGesture(const Offset(150, 150));
+        await gesture.moveBy(Offset(0, reverse ? 100 : -100));
+        for (var frame = 0; frame < 8; frame++) {
+          await tester.pump(const Duration(milliseconds: 16));
+          if (store.requests.length > 1) {
+            expect(button, findsNothing);
+            expect(find.byType(BottomLoader), findsOneWidget);
+          }
+        }
+        expect(store.requests, hasLength(2));
+        await gesture.up();
+        store.requests.last.respond(page(1));
+        await tester.pumpAndSettle();
+        expect(store.requests, hasLength(2));
         await tester.pumpWidget(const SizedBox());
         controller.dispose();
       });
@@ -225,7 +370,10 @@ void main() {
           greaterThan(controller.position.viewportDimension * .2));
       await tester.fling(
           find.byType(CustomScrollView), Offset(0, reverse ? 100 : -100), 1500);
-      await frames(tester);
+      for (var frame = 0; frame < 8; frame++) {
+        await tester.pump(const Duration(milliseconds: 16));
+        if (store.requests.length > 1) expect(button, findsNothing);
+      }
       expect(store.requests, hasLength(2));
       // A quick response with no new visible height must not let the rest of
       // the fling or bounce request further pages.

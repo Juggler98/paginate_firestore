@@ -133,6 +133,11 @@ Rebuilds, programmatic scrolling, and a continuously visible loader do not reque
 more pages. When filling stops, **Load more** remains available; each tap requests
 exactly one page and does not start another fill cycle.
 
+The trailing control shows `bottomLoader` while loading or checking whether to
+fill the viewport, and the button when manual loading is available. In lists it
+sits after the last separator inside `padding`; in grids it occupies the next
+grid cell, matching the original loader placement.
+
 Layout detection supports list/grid views in either scroll direction, reversed
 lists such as chats, and shrink-wrapped views with a finite available viewport.
 In an **unbounded nested layout**, such as a shrink-wrapped view inside a

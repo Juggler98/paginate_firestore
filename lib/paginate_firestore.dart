@@ -6,7 +6,12 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollDirection;
+import 'package:flutter/rendering.dart'
+    show
+        RenderAbstractViewport,
+        RenderSliver,
+        RenderSliverGrid,
+        ScrollDirection;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:provider/provider.dart';
 
@@ -133,6 +138,8 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
   PaginationLoaded? _lastLoadedState;
   Future<void>? _nextPageRequest;
   final _paginationControlKey = GlobalKey();
+  final _itemsSliverKey = GlobalKey();
+  bool _showManualLoadMore = false;
   int _automaticFillPages = 0;
   bool _automaticFillStopped = false;
   bool _scrollGestureAllowed = false;
@@ -172,8 +179,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
           // Consume this scroll action, including its ballistic updates. A fast
           // no-growth response must not turn a continuing fling into a loop.
           _scrollGestureAllowed = false;
-          _scrollRequestAllowed = true;
-          _schedulePaginationCheck();
+          _scheduleScrollRequest();
         }
         return false;
       },
@@ -356,6 +362,19 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     _automaticFillStopped = false;
     _scrollRequestAllowed = false;
     _scrollGestureAllowed = false;
+    _showManualLoadMore = false;
+  }
+
+  void _scheduleScrollRequest() {
+    if (_scrollRequestAllowed) return;
+    _scrollRequestAllowed = true;
+    // Scroll notifications may arrive during layout. Start the request before
+    // the next build, so that frame paints the spinner along with the request.
+    WidgetsBinding.instance.scheduleFrameCallback((_) {
+      if (!mounted || !_scrollRequestAllowed) return;
+      _scrollRequestAllowed = false;
+      _checkPaginationLayout(scrollRequested: true);
+    });
   }
 
   void _schedulePaginationCheck() {
@@ -368,16 +387,15 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     WidgetsBinding.instance.ensureVisualUpdate();
   }
 
-  void _checkPaginationLayout() {
-    final scrollRequested = _scrollRequestAllowed;
-    _scrollRequestAllowed = false;
-    if (_nextPageRequest != null) return;
+  void _checkPaginationLayout({bool scrollRequested = false}) {
+    if (_nextPageRequest != null || _scrollRequestAllowed) return;
     final cubit = _cubit!;
     final state = cubit.state;
     if (state is! PaginationLoaded || state.hasReachedEnd) return;
     final controlContext = _paginationControlKey.currentContext;
-    if (controlContext == null) return;
-    final position = Scrollable.maybeOf(controlContext)?.position;
+    final scrollContext = _itemsSliverKey.currentContext ?? controlContext;
+    if (scrollContext == null) return;
+    final position = Scrollable.maybeOf(scrollContext)?.position;
     if (position == null || !position.hasContentDimensions) return;
 
     // Join an in-flight initial/cache confirmation without spending the budget.
@@ -399,36 +417,66 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
       _fetchNextPage();
       return;
     }
-    if (_automaticFillStopped) return;
+    if (_automaticFillStopped) {
+      _showManualControl();
+      return;
+    }
+
+    // PageView only prefetches when its trailing page is built.
+    if (fallback && controlContext == null) return;
 
     if (!fallback) {
-      final control = controlContext.findRenderObject();
-      if (control is! RenderBox ||
-          !control.hasSize ||
-          _availableViewportExtent <= 0 ||
-          position.viewportDimension <= 0) {
+      if (_availableViewportExtent <= 0 || position.viewportDimension <= 0) {
         return;
       }
-      final controlExtent = widget.scrollDirection == Axis.vertical
+      // A lazy list/grid whose tail is not built already fills its viewport.
+      if (controlContext == null) {
+        _automaticFillStopped = true;
+        _showManualControl();
+        return;
+      }
+      final control = controlContext.findRenderObject();
+      if (control is! RenderBox || !control.hasSize) return;
+      var controlExtent = widget.scrollDirection == Axis.vertical
           ? control.size.height
           : control.size.width;
-      // Exclude the loading control itself. Extents work in both directions and
-      // also let a bounded shrink-wrapped viewport grow to its available size.
-      final contentExtent = position.maxScrollExtent -
-          position.minScrollExtent +
-          position.viewportDimension -
-          controlExtent;
+      if (widget.itemBuilderType == PaginateBuilderType.gridView) {
+        final grid = _itemsSliverKey.currentContext!.findRenderObject()
+            as RenderSliverGrid;
+        final layout = widget.gridDelegate.getLayout(grid.constraints);
+        final count = state.documentSnapshots.length;
+        // A loader sharing the last row adds no height to the grid. Exclude
+        // only the extent it actually adds, including grid spacing.
+        controlExtent = layout.computeMaxScrollOffset(count + 1) -
+            layout.computeMaxScrollOffset(count);
+      }
+      // Scroll metrics clamp short content to the viewport size. Use the actual
+      // sliver extents, including padding/header/footer, then exclude the loader.
+      var contentExtent = -controlExtent;
+      RenderAbstractViewport.of(control).visitChildren((child) {
+        if (child is RenderSliver) {
+          contentExtent += child.geometry?.scrollExtent ?? 0;
+        }
+      });
       if (contentExtent >= _availableViewportExtent - .5) {
         _automaticFillStopped = true;
+        _showManualControl();
         return;
       }
     }
     final budget = fallback
         ? min(1, widget.maxAutomaticFillPages)
         : widget.maxAutomaticFillPages;
-    if (_automaticFillPages >= budget) return;
+    if (_automaticFillPages >= budget) {
+      _showManualControl();
+      return;
+    }
     _automaticFillPages++;
     _fetchNextPage();
+  }
+
+  void _showManualControl() {
+    if (!_showManualLoadMore) setState(() => _showManualLoadMore = true);
   }
 
   void _fetchNextPage() {
@@ -439,6 +487,7 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     if (currentState is! PaginationLoaded || currentState.hasReachedEnd) return;
     final request = cubit.fetchPaginatedList();
     _nextPageRequest = request;
+    _showManualLoadMore = false;
     setState(() {});
     unawaited(request.then((_) {
       if (!identical(_nextPageRequest, request)) return;
@@ -459,7 +508,10 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
     _schedulePaginationCheck();
     return KeyedSubtree(
       key: _paginationControlKey,
-      child: _nextPageRequest != null || _cubit!.state is PaginationInitial
+      child: !_showManualLoadMore ||
+              _nextPageRequest != null ||
+              _cubit!.isFetching ||
+              _cubit!.state is PaginationInitial
           ? widget.bottomLoader
           : Center(
               child: TextButton(
@@ -500,9 +552,13 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
         SliverPadding(
           padding: widget.padding,
           sliver: SliverGrid(
+            key: _itemsSliverKey,
             gridDelegate: widget.gridDelegate,
             delegate: SliverChildBuilderDelegate(
               (context, index) {
+                if (index >= loadedState.documentSnapshots.length) {
+                  return _buildPaginationControl();
+                }
                 final doc = loadedState.documentSnapshots[index];
                 return KeyedSubtree(
                   key: ValueKey(doc.reference.path),
@@ -513,13 +569,12 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
                   ),
                 );
               },
-              childCount: loadedState.documentSnapshots.length,
+              childCount: loadedState.documentSnapshots.length +
+                  (loadedState.hasReachedEnd ? 0 : 1),
               findChildIndexCallback: _documentIndexLookup(loadedState),
             ),
           ),
         ),
-        if (!loadedState.hasReachedEnd)
-          SliverToBoxAdapter(child: _buildPaginationControl()),
         if (widget.footer != null) widget.footer!,
       ],
     );
@@ -551,10 +606,14 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
         SliverPadding(
           padding: widget.padding,
           sliver: SliverList(
+            key: _itemsSliverKey,
             delegate: SliverChildBuilderDelegate(
               (context, index) {
                 final itemIndex = index ~/ 2;
                 if (index.isEven) {
+                  if (itemIndex >= loadedState.documentSnapshots.length) {
+                    return _buildPaginationControl();
+                  }
                   final doc = loadedState.documentSnapshots[itemIndex];
                   return KeyedSubtree(
                     key: ValueKey(doc.reference.path),
@@ -576,15 +635,15 @@ class _PaginateFirestoreState extends State<PaginateFirestore> {
               },
               findChildIndexCallback:
                   _documentIndexLookup(loadedState, stride: 2),
-              childCount: max(0, loadedState.documentSnapshots.length * 2 - 1),
+              childCount: max(
+                  0,
+                  (loadedState.documentSnapshots.length +
+                              (loadedState.hasReachedEnd ? 0 : 1)) *
+                          2 -
+                      1),
             ),
           ),
         ),
-        if (!loadedState.hasReachedEnd &&
-            loadedState.documentSnapshots.isNotEmpty)
-          SliverToBoxAdapter(child: widget.separator),
-        if (!loadedState.hasReachedEnd)
-          SliverToBoxAdapter(child: _buildPaginationControl()),
         if (widget.footer != null) widget.footer!,
       ],
     );
